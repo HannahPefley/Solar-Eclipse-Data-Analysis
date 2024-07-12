@@ -1,0 +1,1003 @@
+---
+title: "Compiles Null Filling"
+output: html_document
+date: "2024-06-14"
+author: "Hannah Pefley, Kristine Lee, Nigel Megison"
+---
+# Loading Libraries
+
+Here, we load in all necessary libraries for our code.
+
+```{r, warning=FALSE,message=FALSE}
+library(tidyverse)
+library(fs)
+library(readr)
+library(mosaic)
+library(dplyr)
+library(effsize)
+library(forecast)
+library(lmtest)
+library(readr)
+library(imputeTS)
+library(Metrics)
+library(caret)
+library(stringr)
+library(lubridate)
+library(VIM)
+library(brms)
+library(httr)
+library(jsonlite)
+
+Sys.setenv(TZ = "GMT")
+```
+
+#Initial Data Entry, importing original data, setting up individual sheets
+
+First of all, there were 6 balloons that had unreliable (GPS Lock 0) starting/initial
+latitude and longitude data. This code manually enters the approximate latitude 
+and longitude of the starting launch points for these balloons (found by searching
+around on the internet for details about the launch events, and extracting the 
+approximate location from Google Maps). We then process our data, creating the 
+`Packet Prefix` column which will be used later for some calculations, as well 
+as separating the initial data into sheets based on balloon located in the 
+"Individual Balloon Sheets" folder. Here we also define an initial function to 
+convert the timestamp column into the number of seconds since midnight.
+
+```{r}
+output_dir<-"Individual Balloon Sheets"
+dir_create(output_dir)
+df <- read_csv('../Original Data/2024-04-08 NSE Eclipse.xlsx - Main.csv', show_col_types = FALSE)
+balloons_of_interest <- unique(df$Balloon)
+
+# WE MANUALLY WENT IN AND LOOKED FOR BALLOONS THAT HAD INVALID FIRST LAT AND
+# LON - AND INPUT THE APPROXIMATE LAT AND LON OF THE LAUNCH AREA (Eastbrook, AMA During,
+# IMS During,  PFW EDU, StockBridge, and US)
+
+
+# Replacing the initial missing latitude and longitude values manually 
+
+df <- df %>%
+  mutate(
+    Lat = if_else(`Packet ID` == "375873.seq.0", 40.5619, Lat),
+    Lon = if_else(`Packet ID` == "375873.seq.0", -85.6479, Lon),
+    `GPS Lock (0 or 1)` = if_else(`Packet ID` == "375873.seq.0", 1, 
+                                  `GPS Lock (0 or 1)`)
+  )
+
+df <- df %>%
+  mutate(
+    Lat = if_else(`Packet ID` == "376329.seq.0", 37.9661, Lat),
+    Lon = if_else(`Packet ID` == "376329.seq.0", -87.6657, Lon),
+    `GPS Lock (0 or 1)` = if_else(`Packet ID` == "376329.seq.0", 1, 
+                                  `GPS Lock (0 or 1)`)
+  )
+
+df <- df %>%
+  mutate(
+    Lat = if_else(`Packet ID` == "377064.seq.0", 39.7936, Lat),
+    Lon = if_else(`Packet ID` == "377064.seq.0", -86.2373, Lon),
+    `GPS Lock (0 or 1)` = if_else(`Packet ID` == "377064.seq.0", 1, 
+                                  `GPS Lock (0 or 1)`)
+  )
+
+df <- df %>%
+  mutate(
+    Lat = if_else(`Packet ID` == "377067.seq.0", 40.1715, Lat),
+    Lon = if_else(`Packet ID` == "377067.seq.0", -85.32, Lon),
+    `GPS Lock (0 or 1)` = if_else(`Packet ID` == "377067.seq.0", 1, 
+                                  `GPS Lock (0 or 1)`)
+  )
+
+df <- df %>%
+  mutate(
+    Lat = if_else(`Packet ID` == "377232.seq.0", 40.9751, Lat),
+    Lon = if_else(`Packet ID` == "377232.seq.0", -84.8688, Lon),
+    `GPS Lock (0 or 1)` = if_else(`Packet ID` == "377232.seq.0", 1, 
+                                  `GPS Lock (0 or 1)`)
+  )
+
+df <- df %>%
+  mutate(
+    Lat = if_else(`Packet ID` == "377553.seq.0", 40.4571, Lat),
+    Lon = if_else(`Packet ID` == "377553.seq.0", -85.5012, Lon),
+    `GPS Lock (0 or 1)` = if_else(`Packet ID` == "377553.seq.0", 1, 
+                                  `GPS Lock (0 or 1)`)
+  )
+
+
+# Filter the data by balloon type, and creating the `Packet Prefix` column
+df_filtered <- df %>% 
+  filter(Balloon %in% balloons_of_interest) %>%
+  mutate(`Packet Prefix` = str_split(`Packet ID`, '\\.', simplify = TRUE)[,1]) %>%
+  arrange(`Packet Prefix`, `Packet ID`)
+
+# Save sorted data into individual .csv files within the specified directory
+for (balloon in balloons_of_interest) {
+  balloon_df <- df_filtered %>% filter(Balloon == balloon)
+  output_file <- file.path(output_dir,
+                           paste0(str_replace_all(balloon, 
+                                                  c(" " = "_", "-" = "_")), '.csv'))
+  write_csv(balloon_df, output_file)
+}
+```
+
+```{r}
+# Define a function to be used later that allows us to convert the Timestamp column
+# into seconds since midnight.
+
+timestamp_to_seconds <- function(timestamp) {
+  components <- strsplit(timestamp, ":")[[1]] 
+  hours <- as.numeric(components[1])
+  minutes <- as.numeric(components[2])
+  seconds <- as.numeric(components[3])
+  total_seconds <- (hours * 3600) + (minutes * 60) + seconds
+return(total_seconds)
+}
+```
+
+# External Temperature, Light, and Acceleration
+
+Based on previous calculations in a seperate file (can be provided), we have 
+determined the best methods to use for modeling these three columns. We will 
+start with `Temperature (F)` and `Light (lux)`, filling in with KNN.
+```{r}
+# Function for imputing missing values 
+templight_knn_imputation <- function(input_file) {
+  data3 <- read_csv(input_file, show_col_types = FALSE)
+  data3$TimestampinSecs <- sapply(as.character(data3$Timestamp), timestamp_to_seconds)
+  
+  # Initialize TempStatus and LightStatus to 0 - indicatine "original" 
+  data3$TempStatus <- 0  
+  data3$LightStatus <- 0
+  
+  # Set TempStatus and LightStatus to 1 where the original columns have NA, 
+  # Indicating that these values are "imputed"
+  data3$TempStatus[is.na(data3$`Temperature (F)`)] <- 1 
+  data3$LightStatus[is.na(data3$`Light (lux)`)] <- 1  
+  
+  # Indicating what columns we want to impute, and performing the imputation with KNN
+  impute3_cols <- c('Light (lux)', 'Temperature (F)')
+  imputed_data <- kNN(data3, variable = impute3_cols, k = 5, dist_var = c("TimestampinSecs", "Packet Prefix"))
+  data3$LightKNN <- ifelse(is.na(data3$`Light (lux)`), imputed_data$`Light (lux)`, NA)
+  data3$TempKNN <- ifelse(is.na(data3$`Temperature (F)`), imputed_data$`Temperature (F)`, NA)
+  
+  # Create TempImputed and LightImputed columns, containing both the inputed 
+  # and original data
+  data3$TempImputed <- ifelse(is.na(data3$`Temperature (F)`), data3$TempKNN, data3$`Temperature (F)`)
+  data3$LightImputed <- ifelse(is.na(data3$`Light (lux)`), data3$LightKNN, data3$`Light (lux)`)
+  
+  # Remove TempKNN and LightKNN columns (this removes the columns that just 
+  # contained imputed values, but can be deleted if those columns are desired)
+  data3 <- data3 %>% select(-TempKNN, -LightKNN)
+  
+  return(data3)
+}
+
+# Setting input folder and the folder to write out the processed files to
+input_folder <- "Individual Balloon Sheets"
+output_folder <- "FillInNulls"
+dir.create(output_folder, showWarnings = FALSE)
+files <- list.files(input_folder, full.names = TRUE)
+
+#processing the files
+for (file in files) {
+  output_data3 <- templight_knn_imputation(file)
+  file_name <- tools::file_path_sans_ext(basename(file))
+  write_csv(output_data3, file.path(output_folder, paste0(file_name, ".csv")))
+}
+```
+Now we take these files and fill in the Acceleration with the mean
+```{r}
+# Function to calculate the average per packet and use that to impute the null
+calculate_accel_avg_per_packet <- function(dataframe, packet_prefix) {
+  new_column <- "AccelMean"
+  
+  # Initialize AccelStatus to 0
+  dataframe$AccelStatus <- 0
+  
+  # Set AccelStatus to 1 where the Acceleration (g) column has NA
+  dataframe$AccelStatus[is.na(dataframe$`Acceleration (g)`)] <- 1
+  
+  # Calculate AccelMean and create AccelImputed from combining the original and
+  # imputed data
+  dataframe <- dataframe %>%
+    group_by(!!sym(packet_prefix)) %>%
+    mutate(
+      !!new_column := if_else(is.na(`Acceleration (g)`),
+                              mean(`Acceleration (g)`, na.rm = TRUE),
+                              NA_real_),
+      AccelImputed = if_else(is.na(`Acceleration (g)`), !!sym(new_column), `Acceleration (g)`)
+    ) %>%
+    ungroup()
+  
+  # Remove AccelMean column (this removes the column that just 
+  # contained imputed values, but can be deleted if those columns are desired)
+  dataframe <- dataframe %>% select(-!!sym(new_column))  
+  
+  return(dataframe)
+}
+
+# Initialize input and output folders, in this case they are the same, as we want
+# to minimize the amount of files generated.
+input_folder <- "FillInNulls"
+output_folder <- "FillInNulls"
+dir_create(output_folder)
+files <- dir_ls(input_folder, regexp = "\\.csv$")
+
+# Process the files
+for (file in files) {
+  df <- read_csv(file, show_col_types = FALSE)
+  df <- df %>% calculate_accel_avg_per_packet('Packet Prefix')
+  file_name <- path_file(file)
+  output_file_path <- file.path(output_folder, file_name)
+  write_csv(df, output_file_path)
+}
+
+# Compile files into a larger file for quick reference to all data
+processed_files <- dir_ls(output_folder, regexp = "\\.csv$")
+data_frames <- lapply(processed_files, function(file_path) {
+  read_csv(file_path, show_col_types = FALSE)
+})
+combined_data_means <- bind_rows(data_frames)
+combined_output_file <- "AllNullsFilled.csv"
+write_csv(combined_data_means, combined_output_file)
+
+```
+
+# Latitude and longitude
+
+Now we move onto imputing the remaining columns. 
+First, we want to read in the files and add extra rows for the missing seconds 
+that were still not captured by the nulls alone. Doing this will potentially aid
+us in making smoother maps and diagrams when it comes to spacial variables like
+latitude, longitude, and altitude. 
+```{r}
+# Function to process files in a folder and fill missing timestamps
+process_files_in_folder <- function(input_folder, output_folder) {
+  files <- list.files(path = input_folder, full.names = TRUE)
+  
+  for (file in files) {
+    df <- read_csv(file, show_col_types = FALSE)
+    
+    df$Timestamp <- paste0("2024-04-08 ", df$Timestamp)
+
+    # Convert Timestamp to POSIXct if not already
+    if (!inherits(df$Timestamp, "POSIXct")) {
+  df$Timestamp <- as.POSIXct(df$Timestamp, format="%Y-%m-%d %H:%M:%OS", tz = "UTC")
+}
+    # adding additional timestamps down to the second
+    balloon_value <- unique(df$Balloon)
+    min_time <- min(df$Timestamp)
+    max_time <- max(df$Timestamp)
+    all_timestamps <- seq.POSIXt(min_time, max_time, by = "1 sec")
+    filled_df <- data.frame(Timestamp = all_timestamps, Balloon = balloon_value)
+    filled_df <- merge(filled_df, df, by = "Timestamp", all.x = TRUE)
+    
+    # Calculate TimestampinSecs
+    #filled_df$TimestampinSecs <- as.numeric(difftime(filled_df$Timestamp, min_time, units = "secs"))
+    filled_df$TimestampinSecs <- sapply(strftime(as.character(filled_df$Timestamp), format="%H:%M:%S", tz="UTC"), timestamp_to_seconds)
+    
+    # Write filled_df to output file
+    output_file <- file.path(output_folder, paste0("extra_seconds_", basename(file)))
+    
+    print(filled_df)
+    head(filled_df)
+    write_csv(filled_df, file = output_file)
+  }
+}
+
+# Example usage:
+input_folder <- "FillInNulls"
+output_folder <- "ExtraSecondsFiles"
+
+dir.create(output_folder, showWarnings = FALSE)  # Create output folder if it doesn't exist
+process_files_in_folder(input_folder, output_folder)
+```
+
+Now we can fill in the latitude and longitude nulls using linear regression, 
+writing the files with the original nulls back to the `FillInNulls` file, and 
+the ones with extra seconds back to `ExtraSecondsFiles`.
+```{r}
+# Adjust files to have `AdjLat` and `AdjLon` columns - with nullified 
+# GPS seq 0 values
+file_paths <- list.files(path = "ExtraSecondsFiles", pattern = ".csv$", 
+                         full.names = TRUE)
+
+for (file in file_paths) {
+  data <- read_csv(file, show_col_types = FALSE)
+  data <- data %>%
+    mutate(
+      AdjLat = ifelse(is.na(`GPS Lock (0 or 1)`) | `GPS Lock (0 or 1)` == 0, NA, Lat),
+      AdjLon = ifelse(is.na(`GPS Lock (0 or 1)`) | `GPS Lock (0 or 1)` == 0, NA, Lon)
+    )
+  write_csv(data, file)
+}
+
+# Function to process the balloons and impute each null value using linear regression
+process_balloon_data <- function(file_path, output_path, original_output_path) {
+  subData <- read_csv(file_path, show_col_types = FALSE)
+  subData <- cbind(subData, LatReg = NA, LonReg = NA, AdjLatFilled = subData$AdjLat, 
+                   AdjLonFilled = subData$AdjLon, LatStatus = 0, LonStatus = 0, 
+                   `originalLatNulls` = NA, `originalLonNulls` = NA)
+
+  subData <- subData[order(subData$TimestampinSecs, decreasing = FALSE), ]
+  null_indices_lat <- which(is.na(subData[["AdjLat"]]))
+  for (i in null_indices_lat) {
+    valid_rows <- subData %>%
+      filter(!is.na(AdjLatFilled))
+    
+    prev_latitudes <- valid_rows %>%
+      filter(row_number() <= i & LatStatus == 0) %>%
+      tail(3)
+    
+    next_latitudes <- valid_rows %>%
+      filter(row_number() >= i & LatStatus == 0) %>%
+      head(2)
+    
+    modelsubsetLat <- bind_rows(prev_latitudes, next_latitudes)
+    
+    if (length(prev_latitudes$AdjLatFilled) > 2 && 
+        length(next_latitudes$AdjLatFilled) > 1)  {
+      regmodel <- lm(AdjLatFilled ~ TimestampinSecs+I(TimestampinSecs^2)+
+                       I(TimestampinSecs^3), data = modelsubsetLat)
+    }else{
+      prev_latitudes <- valid_rows %>%
+        filter(row_number() <= i & LatStatus == 0) %>%
+        tail(2)
+      
+      next_latitudes <- valid_rows %>%
+        filter(row_number() >= i & LatStatus == 0) %>%
+        head(1)
+      
+      regmodel <- lm(AdjLatFilled ~ TimestampinSecs+I(TimestampinSecs^2)+I(TimestampinSecs^3), data = modelsubsetLat)
+    }
+    
+    predicted_lat <- suppressWarnings(predict(regmodel, newdata = 
+                               data.frame(TimestampinSecs = subData$TimestampinSecs[i])))
+    subData$LatReg[i] <- predicted_lat
+    subData$AdjLatFilled[i] <- predicted_lat
+    subData$LatStatus[i] <- 1
+    if (!is.na(subData$`Packet ID`[i])) {
+      subData$`originalLatNulls`[i] <- predicted_lat
+    }
+  }
+  
+  null_indices_lon <- which(is.na(subData[["AdjLon"]]))
+  for (i in null_indices_lon) {
+    valid_rows <- subData %>%
+      filter(!is.na(AdjLonFilled))
+    
+    prev_longitudes <- valid_rows %>%
+      filter(row_number() <= i & LonStatus == 0) %>%
+      tail(3)
+    
+    next_longitudes <- valid_rows %>%
+      filter(row_number() >= i & LonStatus == 0) %>%
+      head(2)
+    
+    modelsubsetLon <- bind_rows(prev_longitudes, next_longitudes)
+    
+    if (length(prev_longitudes$AdjLonFilled) > 2 && length(next_longitudes$AdjLonFilled) > 1) {
+      regmodel <- lm(AdjLonFilled ~ TimestampinSecs+I(TimestampinSecs^2)+I(TimestampinSecs^3), data = modelsubsetLon)
+     }
+     else{
+       prev_longitudes <- valid_rows %>%
+         filter(row_number() <= i & LonStatus == 0) %>%
+         tail(2)
+       
+       next_longitudes <- valid_rows %>%
+         filter(row_number() >= i & LonStatus == 0) %>%
+         head(1)
+       
+       regmodel <- lm(AdjLonFilled ~ TimestampinSecs+I(TimestampinSecs^2)+I(TimestampinSecs^3), data = modelsubsetLon)
+     }
+    predicted_lon <- suppressWarnings(predict(regmodel, newdata = 
+                               data.frame(TimestampinSecs = subData$TimestampinSecs[i])))  
+    subData$LonReg[i] <- predicted_lon
+    subData$AdjLonFilled[i] <- predicted_lon
+    subData$LonStatus[i] <- 1
+    if (!is.na(subData$`Packet ID`[i])) {
+      subData$`originalLonNulls`[i] <- predicted_lon
+    }
+  }
+  
+  seconds_subData <- subData %>%
+    select(-c(LatReg, LonReg, AdjLat, AdjLon, Balloon.y, originalLonNulls, originalLatNulls)) %>%
+  rename(Balloon = Balloon.x)
+  
+  write_csv(subData, file = output_path)
+  
+  filtered_subData <- subData %>%
+    filter(!is.na(`Packet ID`)) %>%
+    select(-c(LatReg, LonReg, AdjLat, AdjLon, Balloon.y, originalLonNulls, originalLatNulls)) %>%
+  rename(Balloon = Balloon.x)
+  
+  write_csv(filtered_subData, file = original_output_path)
+  
+}
+
+# Defining input and output paths, being sure to do so for both the files with
+# the extra seconds, as well as a version with just the original nulls
+input_files <- list.files(path = "ExtraSecondsFiles", pattern = "\\.csv$", full.names = TRUE)
+output_folder <- "ExtraSecondsFiles2"
+original_output_folder <- "FillInNulls"
+dir.create(output_folder, showWarnings = FALSE)
+
+for (file in input_files) {
+  output_file <- file.path(output_folder, basename(file))
+  original_file_name <- basename(file)
+  modified_file_name <- sub("^extra_seconds_", "", original_file_name)
+  original_output_file <- file.path(original_output_folder, modified_file_name)
+  process_balloon_data(file, output_file, original_output_file)
+}
+
+# Write the files with the extra seconds to a combined file
+file_paths <- list.files(path = output_folder, pattern = "\\.csv$", full.names = TRUE)
+data_frames <- lapply(file_paths, read_csv, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data,"extrasecondsfilled.csv")
+
+# Write the files with just the original nulls to a combined file
+file_paths <- list.files(path = original_output_folder, pattern = "\\.csv$", full.names = TRUE)
+data_frames <- lapply(file_paths, read_csv, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data,"AllNullsFilled.csv")
+```
+# Altitude
+Now, we can move onto imputing Altitude, using linear regression as well
+```{r}
+process_alt_data <- function(file, output_path) {
+  data <- read_csv(file, show_col_types = FALSE)
+  
+  # Create a new column for altitude in feet
+  data$ActualAltitudeInFeet <- data$`Altitude (ft)` * 3.28084
+  
+  minidata <- data
+  minidata$altREG <- NA
+  minidata$AltStatus <- 0  # Initialize AltStatus column
+
+  null_indices_temp <- which(is.na(data[["ActualAltitudeInFeet"]]))
+  for (i in null_indices_temp) {
+    
+    # Find nearest non-NA values
+    before <- suppressWarnings(max(which(!is.na(data$ActualAltitudeInFeet)[1:i])))
+    
+    # Warnings are because there is no before for the first packet
+    after <- which(!is.na(data$ActualAltitudeInFeet)[(i+1):length(data$ActualAltitudeInFeet)])
+    after <- sort(after)[1:2] + i
+    
+    # Ensure indices are integers
+    before <- suppressWarnings(as.integer(before))
+    after <- as.integer(after)
+    
+    subset_indices <- c(before, i, after)
+    subset_data <- data[subset_indices, ]
+    
+    subset_minidata <- minidata[subset_indices, ]
+    regmodel <- lm(ActualAltitudeInFeet ~ TimestampinSecs + I(TimestampinSecs^2), data = subset_minidata)
+    
+    predicted_value <- predict(regmodel, newdata = data.frame(TimestampinSecs = minidata$TimestampinSecs[i]))
+    
+    # To ensure no accidental negative values
+    if(predicted_value < 0) {
+      predicted_value <- 0
+    }
+    minidata$`altREG`[i] <- predicted_value
+    minidata$AltStatus[i] <- 1 
+  }
+  
+  minidata$AltImputed <- ifelse(is.na(minidata$ActualAltitudeInFeet), minidata$altREG, minidata$ActualAltitudeInFeet)
+  
+  minidata <- minidata[, -which(names(minidata) == "altREG")]
+  
+  write_csv(minidata, output_path)
+}
+
+input_files <- list.files(path = "FillInNulls", pattern = ".csv$", full.names = TRUE)
+output_dir <- "FillInNulls"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+for (file in input_files) {
+  file_name <- tools::file_path_sans_ext(basename(file))
+  output_file <- file.path(output_dir, paste0(file_name, ".csv"))
+  data <- read_csv(file, show_col_types = FALSE)
+  if (sum(!is.na(data$`Altitude (ft)`)) == 0) {
+    next
+  }
+  suppressWarnings(process_alt_data(file, output_file))
+}
+
+file_paths <- list.files(path = output_dir, pattern = "\\.csv$", full.names = TRUE)
+data_frames <- lapply(file_paths, read_csv, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data, "AllNullsFilled.csv")
+```
+# Internal Temperature
+```{r}
+process_inttemp_data <- function(file, output_path) {
+  data <- read_csv(file, show_col_types = FALSE)
+  if (sum(!is.na(data$`Internal Temperature (F)`)) <=1){
+    break
+  }
+  minidata <- data
+  minidata$intREG <- NA
+  minidata$IntTempStatus <- 0
+  #minidata$TimestampinSecs <- sapply(as.character(data$Timestamp), timestamp_to_seconds)
+  
+  null_indices_temp <- which(is.na(data[["Internal Temperature (F)"]]))
+  
+  for (i in null_indices_temp) {
+    if(unique(data$Balloon)=="AMA_During"){
+      # Find nearest non-NA values
+      before <- suppressWarnings(max(which(!is.na(data$`Internal Temperature (F)`)[1:i] & (data$`Internal Temperature (F)`!=32)[1:i])))
+      
+      #warnings are because there is no before for the first packet
+      after <- which(!is.na(data$`Internal Temperature (F)`)[(i+1):length(data$`Internal Temperature (F)`)] & (data$`Internal Temperature (F)`!=32)[(i+1):length(data$`Internal Temperature (F)`)])
+      after <- sort(after)[1:2] + i
+    }
+    else{
+      # Find nearest non-NA values
+      before <- suppressWarnings(max(which(!is.na(data$`Internal Temperature (F)`)[1:i])))
+      
+      #warnings are because there is no before for the first packet
+      after <- which(!is.na(data$`Internal Temperature (F)`)[(i+1):length(data$`Internal Temperature (F)`)])
+      after <- sort(after)[1:2] + i
+    }
+    # Ensure indices are integers
+    before <- suppressWarnings(as.integer(before))
+    after <- as.integer(after)
+    
+    subset_indices <- c(before, i, after)
+    subset_data <- data[subset_indices, ]
+    subset_minidata <- minidata[subset_indices, ]
+    
+    regmodel <- lm(`Internal Temperature (F)` ~ TimestampinSecs + I(TimestampinSecs^2), data = subset_minidata)
+    predicted_value <- predict(regmodel, newdata = data.frame(TimestampinSecs = minidata$TimestampinSecs[i]))
+    
+    minidata$`intREG`[i] <- predicted_value
+    minidata$IntTempStatus[i] <- 1 
+  }
+  
+  # Create IntTempCombined column
+  minidata$IntTempImputed <- ifelse(is.na(minidata$`Internal Temperature (F)`),
+                                    minidata$intREG, 
+                                    minidata$`Internal Temperature (F)`)
+
+  # Remove intREG column from minidata
+  minidata <- minidata[, -which(names(minidata) == "intREG")]
+
+  write_csv(minidata, output_path)
+  
+}
+
+input_files <- list.files(path = "FillInNulls", pattern = ".csv$", 
+                          full.names = TRUE)
+output_dir <- "FillInNulls"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+for (file in input_files) {
+  output_file <- file.path(output_dir, basename(file))
+  suppressWarnings(process_inttemp_data(file, output_file))
+}
+
+file_paths <- list.files(path = output_dir, pattern = "\\.csv$", full.names = TRUE)
+data_frames <-  read_csv(file_paths, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data, "AllNullsFilled.csv")
+```
+# IR and UVA
+
+```{python, warning=FALSE}
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+import numpy as np
+from datetime import datetime
+import os
+
+# Extracting hour, minute, and second from the timestamp as per our dataset 
+def extract_time_features(time_str):
+    try:
+        time_obj = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        try:
+            time_obj = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            time_obj = datetime.strptime(time_str, "%H:%M:%S")
+    return time_obj.hour, time_obj.minute, time_obj.second
+
+# Converting timestamp to seconds 
+def convert_to_seconds(time_str, reference_time):
+    try:
+        time_obj = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        try:
+            time_obj = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            time_obj = datetime.strptime(time_str, "%H:%M:%S")
+    return (time_obj - reference_time).total_seconds()
+
+# Finding nearest non-NA values 
+def nearest_non_na(series):
+    before = series.fillna(method='ffill')
+    after = series.fillna(method='bfill')
+    return before, after
+
+def random_forest_prediction_per_balloon(data, feature, n_estimators=100, max_depth=10, random_state=42):
+    balloon_data = data.copy()
+    
+    # Looking for nearest non-NA values
+    balloon_data['Timestamp_seconds_before'], balloon_data['Timestamp_seconds_after'] = nearest_non_na(balloon_data['TimestampinSecs'])
+    
+    # Lag and lead features
+    balloon_data['Timestamp_lag1'] = balloon_data['TimestampinSecs'].shift(1)
+    balloon_data['Timestamp_lead1'] = balloon_data['TimestampinSecs'].shift(-1)
+    balloon_data['Timestamp_lag2'] = balloon_data['TimestampinSecs'].shift(2)
+    balloon_data['Timestamp_lead2'] = balloon_data['TimestampinSecs'].shift(-2)
+    
+    balloon_data['Timestamp_lag1'].fillna(method='bfill', inplace=True)
+    balloon_data['Timestamp_lead1'].fillna(method='ffill', inplace=True)
+    balloon_data['Timestamp_lag2'].fillna(method='bfill', inplace=True)
+    balloon_data['Timestamp_lead2'].fillna(method='ffill', inplace=True)
+    
+    features = ['TimestampinSecs', 'Timestamp_lag1', 'Timestamp_lead1', 'Timestamp_lag2', 'Timestamp_lead2', 'Hour', 'Minute', 'Second']
+    poly = PolynomialFeatures(degree=3, interaction_only=False, include_bias=False)
+    X_poly = poly.fit_transform(balloon_data[features])
+    
+    scaler = StandardScaler()
+    X_poly = scaler.fit_transform(X_poly)
+    
+    X_full = scaler.transform(poly.transform(balloon_data[features]))
+    
+    train = balloon_data.dropna(subset=[feature])
+    
+    if train.empty:
+        print(f"No data available for training for {feature}")
+        return None, None
+    
+    X_train = scaler.transform(poly.transform(train[features]))
+    y_train = train[feature]
+    
+    model = RandomForestRegressor(n_estimators=n_estimators, max_depth=10, random_state=random_state)
+    model.fit(X_train, y_train)
+    
+    predictions = model.predict(X_full)
+    
+    return predictions, balloon_data.index
+
+directory = 'FillInNulls'
+
+results = {}
+for file_name in os.listdir(directory):
+    if file_name.endswith('.csv'):
+        file_path = os.path.join(directory, file_name)
+        
+        try:
+            data = pd.read_csv(file_path)
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            continue
+        
+        # Removing rows with missing balloon names for easy hanndling
+        data = data.dropna(subset=['Balloon'])
+        
+        # Extracting time features (hour, minute, second) from the 'Timestamp' column
+        data[['Hour', 'Minute', 'Second']] = data['Timestamp'].apply(lambda x: pd.Series(extract_time_features(x)))
+        
+        # Checking if 'TimestampinSecs' column exists, if not, we create it because i was having problems with it
+        if 'TimestampinSecs' not in data.columns:
+            first_timestamp = data['Timestamp'].iloc[0]
+            try:
+                reference_time = datetime.strptime(first_timestamp, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                try:
+                    reference_time = datetime.strptime(first_timestamp, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    reference_time = datetime.strptime(first_timestamp, "%H:%M:%S")
+            data['TimestampinSecs'] = data['Timestamp'].apply(lambda x: convert_to_seconds(x, reference_time))
+        
+        data['IR (scale) predicted'] = np.nan
+        data['UVA (W/m^2) predicted'] = np.nan
+        
+        print(f"Processing file: {file_path}")
+        
+        ir_predictions, ir_indices = random_forest_prediction_per_balloon(data, 'IR (scale)', n_estimators=100, max_depth=10)
+        if ir_predictions is not None:
+            data.loc[ir_indices, 'IR (scale) predicted'] = ir_predictions
+        
+        uva_predictions, uva_indices = random_forest_prediction_per_balloon(data, 'UVA (W/m^2)', n_estimators=100, max_depth=10)
+        if uva_predictions is not None:
+            data.loc[uva_indices, 'UVA (W/m^2) predicted'] = uva_predictions
+        
+        output_file_path = file_path.replace('.csv', '.csv')
+        data.to_csv(output_file_path, index=False)
+        print(f"Saved predictions to {output_file_path}")
+        
+        results[file_path] = data
+
+```
+```{r}
+
+files <- list.files(path = "FillInNulls", pattern = "*.csv", full.names = TRUE)
+
+for (file in files) {
+  data <- read_csv(file)
+  # Create UVAStatus column
+  if ("UVA (W/m^2)" %in% colnames(data)) {
+    data$UVAStatus <- ifelse(is.na(data[["UVA (W/m^2)"]]), 1, 0)
+  } else {
+    warning(paste("Column 'UVA (W/m^2)' not found in file:", file))
+  }
+  
+  # Create IRStatus column 
+  if ("IR (scale)" %in% colnames(data)) {
+    data$IRStatus <- ifelse(is.na(data[["IR (scale)"]]), 1, 0)
+  } else {
+    warning(paste("Column 'IR (scale)' not found in file:", file))
+  }
+  write_csv(data, file)
+}
+
+file_paths <- list.files(path = files, pattern = "\\.csv$", full.names = TRUE)
+data_frames <- lapply(files, read_csv, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data,"AllNullsFilled.csv")
+```
+# Indicator Column for if it is totality or not
+
+```{r}
+is_totality <- function(file) {
+  data <- read_csv(file, show_col_types = FALSE)
+  base_url <- "https://aa.usno.navy.mil/api/eclipses/solar/date?date=2024-04-08"
+  data$totality <- NA
+  eclipse_over <- FALSE
+  
+  for (i in 1:nrow(data)) {
+    if (eclipse_over) {
+      data$totality[i] <- 0
+      next
+    }
+    total_eclipse <- FALSE
+    if (!is.na(data$AdjLatFilled[i]) && !is.na(data$AdjLonFilled[i])){
+      #lat <- data$Lat[i]
+      lat <- data$AdjLatFilled[i]
+      #lon <- data$Lon[i]
+      lon <- data$AdjLonFilled[i]
+      
+      #original thing that worked for original time
+      # time <- as.character(data$Timestamp[i])  
+      # time <- as.POSIXct(time, format = "%H:%M:%OS", tz="EST")
+      # time <- as.POSIXct(time, tz="UTC")
+      # time <- time - 3600
+      
+      time <- as.character(data$Timestamp[i])  
+
+      # #added to only take time
+      time <- strftime(time, format="%H:%M:%S", tz="UTC")
+      time <- as.POSIXct(time, format = "%H:%M:%OS", tz="EST")
+      time <- as.POSIXct(time, format="%H:%M:%S", tz="UTC")
+      time <- time - 3600
+      
+      
+      params <- paste0("&coords=", lat, ",", lon, "&height=15")#, height)
+      response <- GET(paste0(base_url, params))
+      
+      if (status_code(response) != 200) {
+        next
+      }
+      eclipse_data <- fromJSON(content(response, as = "text", encoding = "UTF-8"))
+
+      if (length(eclipse_data$properties$local_data) == 0 || length(eclipse_data$properties$local_data$phenomenon)<=3) {
+        data$totality[i] <- 0
+      } else {
+        local_data <- eclipse_data$properties$local_data
+        #begin_time <- as.POSIXct(paste("2024-04-08", local_data$time[2]), tz = "UTC")
+        begin_time <- as.POSIXct(local_data$time[2], format = "%H:%M:%OS", tz = "UTC")
+        #end_time <- as.POSIXct(paste("2024-04-08", local_data$time[4]), tz = "UTC")
+        end_time <- as.POSIXct(local_data$time[4], format = "%H:%M:%OS", tz = "UTC")
+          if (time >= begin_time && time <= end_time) {
+            total_eclipse <- TRUE
+            #print(time)
+            }
+        if(total_eclipse == TRUE){
+          data$totality[i] <- 1
+        }
+        else{
+          data$totality[i] <- 0
+        }
+        #data$totality[i] <- ifelse(total_eclipse, 1, 0)
+        if ((time-(60*10))  > end_time) {
+             #print(i)
+           eclipse_over <- TRUE
+            #print("Eclipse is over. Exiting loop.")
+         }
+      }
+    } else {
+      data$totality[i] <- 0
+    }
+  }
+  write_csv(data, file.path("FillInNulls", basename(file)))
+}
+
+files <- list.files(path = "FillInNulls", pattern = "*.csv", full.names = TRUE)
+
+for (file in files) {
+  is_totality(file)
+}
+
+# Write the files to a combined file
+file_paths <- list.files(path = files, pattern = "\\.csv$", full.names = TRUE)
+data_frames <- lapply(files, read_csv, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data,"AllNullsFilled.csv")
+```
+# Removing the Hour, minute, and second column
+```{r}
+#final_data <- combined_data %>%
+#    select(-c(Hour, Minute, Second))
+#write_csv(final_data,"AllNullsFilled.csv")
+```
+# Percent Totality
+Calculating the percent of sun that is covered at any given time
+```{r}
+# Construct the function that calculates the percent coverage based on the ratio
+# of the moon and sun sizes (in our case it is 1.05), the time that the moon starts
+# to cover the sun, the time it is completely off of the sun, the highest obscuration 
+# (highest percent of the sun that gets covered by the moon at that lat and lon-
+# due to our balloons location, currently this is not being used for calculations,
+# but it may have potential to be adapted later if needed
+
+circle_intersection_area <- function(ratio, start_time, end_time, obscuration, current_time) {
+  # Determine the number of milliseconds that has passed since
+  ratio <- 1.05
+  total_time <- as.numeric(difftime(end_time, start_time, units = "secs")) * 1000  # convert to milliseconds
+  rS <- 1
+  rM <- sqrt(ratio)
+  rate_of_center_distance <- (2 + 2 * sqrt(ratio)) / total_time
+  current_time_diff <- as.numeric(difftime(current_time, start_time, units = "secs")) * 1000  # convert to milliseconds
+  center_distance_at_current_time <- abs((1 + sqrt(ratio)) - (current_time_diff * rate_of_center_distance))
+  d <- center_distance_at_current_time
+  if (d >= rS + rM) {
+    return(0)
+  }
+  
+  if (d <= abs(rS-rM)){
+    return(1)
+  }
+  
+  # Calculate intersection area
+  A1 <- rS^2 * acos((d^2 + rS^2 - rM^2) / (2 * d * rS))
+  A2 <- rM^2 * acos((d^2 + rM^2 - rS^2) / (2 * d * rM))
+  A3 <- 0.5 * sqrt((-d + rS + rM) * (d + rS - rM) * (d - rS + rM) * (d + rS + rM))
+  
+  A <- A1 + A2 - A3
+  
+  return(A/pi)
+}
+
+input_files <- list.files(path = "FillInNulls", pattern = ".csv$", full.names = TRUE)
+output_dir <- "FillInNulls"
+for (file in input_files) {
+  data <- read_csv(file, show_col_types = FALSE)
+  
+  base_url <- "https://aa.usno.navy.mil/api/eclipses/solar/date?date=2024-04-08"
+  data$PercentTotality <- NA
+  for (i in 1:nrow(data)) {
+    if (is.na(data$totality[i])){
+      data$totality[i] <- 0
+    }
+    if (data$totality[i]==1){
+      data$PercentTotality[i] <- 1
+      next
+    }
+    if (!is.na(data$AdjLatFilled[i]) && !is.na(data$AdjLonFilled[i])){
+      lat <- data$AdjLatFilled[i]
+      lon <- data$AdjLonFilled[i]
+      time <- as.character(data$Timestamp[i])  
+      # #added to only take time and not include data from Hannah
+      time <- strftime(time, format="%H:%M:%S", tz="UTC")
+      time <- as.POSIXct(time, format = "%H:%M:%OS", tz="EST")
+      time <- as.POSIXct(time, format="%H:%M:%S", tz="UTC")
+      current_time <- time - 3600
+      
+      params <- paste0("&coords=", lat, ",", lon, "&height=15")
+      response <- GET(paste0(base_url, params))
+      
+      if (status_code(response) != 200) {
+        next
+      }
+      eclipse_data <- fromJSON(content(response, as = "text", encoding = "UTF-8"))
+      if (length(eclipse_data$properties$local_data) == 0 || 
+          length(eclipse_data$properties$local_data$phenomenon)<3) {
+        data$PercentTotality[i] <- "ERROR"
+      } else if(eclipse_data$properties$obscuration != "100.0%"){
+        data$PercentTotality[i] <- "Out of Path"
+      } else {
+        local_data <- eclipse_data$properties$local_data
+        start_time <- as.POSIXct(local_data$time[1], format = "%H:%M:%OS", 
+                                 tz = "UTC")
+        if(length(eclipse_data$properties$local_data$phenomenon)==3){
+          end_time <- as.POSIXct(local_data$time[3], format = "%H:%M:%OS", 
+                                 tz = "UTC")
+        }else{
+          end_time <- as.POSIXct(local_data$time[5], format = "%H:%M:%OS",
+                                 tz = "UTC")
+        }
+      
+        obscuration <- eclipse_data$properties$obscuration
+        if (missing(start_time) || missing(end_time) || missing(current_time)) {
+             next
+        }
+        
+        percent_coverage <- circle_intersection_area(ratio = 1.05, start_time, 
+                                                     end_time, obscuration = 1, 
+                                                     current_time)
+        data$PercentTotality[i] <- percent_coverage
+      }
+    }
+  }
+  write_csv(data, file)
+}
+
+file_paths <- list.files(path = "FillInNulls", pattern = "\\.csv$", 
+                         full.names = TRUE)
+
+# Function to read and modify each dataframe
+read_and_modify <- function(file) {
+  df <- read_csv(file, show_col_types = FALSE)
+  df <- df %>%
+    mutate(PercentTotality = as.character(PercentTotality))
+  return(df)
+}
+
+# Apply the function to all files and combine the results
+data_frames <- lapply(file_paths, read_and_modify)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data,"AllNullsFilled.csv")
+```
+# Ascent or Descent
+We also create an additional column detailing whether, at any given time, the 
+balloon is on it's ascent or if the balloon has popped and it is on it's descent.
+(1 for Ascent, 0 for Descent)
+```{r}
+ascent <- function(file){
+  data <- read_csv(file, show_col_types = FALSE)
+  max <- max(data$AltImputed)
+  ascent <- TRUE
+  data$Ascent <- NA
+  for (i in 1:nrow(data)) {
+    if (data$AltImputed[i]<max && ascent==TRUE){
+      data$Ascent[i] <- 1
+    } #else 
+    if (data$AltImputed[i]==max){
+      data$Ascent[i] <-1
+      ascent <- FALSE
+    }
+    if(ascent == FALSE  && data$AltImputed[i]!=max){
+      data$Ascent[i] <- 0
+    }
+     }
+  write_csv(data, file)
+}
+
+files <- list.files(path = "FillInNulls", pattern = "*.csv", full.names = TRUE)
+for (file in files) {
+  ascent(file)
+}
+
+# Write the files to a combined file
+file_paths <- list.files(path = files, pattern = "\\.csv$", full.names = TRUE)
+data_frames <- lapply(files, read_and_modify)
+#data_frames <- lapply(files, read_csv, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data,"AllNullsFilled.csv")
+
+#to add file to the Folder containing Shiny app
+write_csv(combined_data,"../Interactive Application/AllNullsFilled.csv")
+```
