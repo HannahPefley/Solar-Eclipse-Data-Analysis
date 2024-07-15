@@ -3,6 +3,8 @@
 ## Project Description
 This repository contains the results of an 8-week period of research and analysis completed by three undergraduate students from Taylor University, during the summer of 2024. The team was presented with an outside data source, collected from weather balloons launched the day of the total solar eclipse on April 8th, 2024. The files here guide through the process of preprocessing the dataset, adding additional columns, performing analysis on the data, and developing deliverable results. 
 
+## Data Availability
+As of the latest update to this repository, the data used to conduct this study is not publically available, and is thus not included with the files here. However, there is potential for it to be available upon request. 
 
 ## Installations and setup
 This code was primarily written and made to run in an RStudio Environment, and thus the following packages may need to be installed:
@@ -39,11 +41,24 @@ You may also need to install the following Python packages: panda, numpy, scikit
 To recreate our analysis and steps from our report in their entirety, several files are provided. We will explain the structure and basic function of the provided files and folders, while explanation of any additional created files and folders can be found within the files that create them themselves. It's important to note that many of these files are set up to read from the results of previous files (and thus could be used in the future with new/additional data) to provide a similar analysis
 
 ## Contents
+***Order of operation:*** These files follow the 8-week process of research and analysis from start to finish, and as such many of the later files depend on results from earlier files. Here is a brief note on the most optimal order these files are to be run:
 
+	1. ExplainationOfImputation.Rmd - Reads from original file
+		
+	2. FillingAllNulls.qmd - Reads from original file- exports cleaned data. Necessary to run.
+	
+	3. cleaning moon.R - Reads from OriginalMoonData.csv, exports expanded_testingcleaningofmoon.csv. Necessary to run for app.R
+	
+	4. app.R - Reads from cleaned data and 
+	 
+	5. AltitudeAndAccel.Rmd - analysis of cleaned data
+	 
+	6. TemperatureAnalysis.ipynb - analysis of cleaned data
+      
 ### PreProcessing Files
 
 #### ExplainationOfImputation.Rmd  
-The file detailing the steps of selecting methods of imputation for the columns for 3 variables: Temperature, Acceleration, and Light. It is important to note that the purpose of this file is simply exploration of the reasoning behind the methods of imputation selected for later use; it is not intended to be the main file of imputation itself. This file reads in the original data set and creates several folders consisting of the data necessary for explanation of the models, as well as displays graphs showing the resulting “best” imputations. It is one level down from the main files, within the “Explaining Imputation of First Three Columns” folder, as to properly contain the files it generates, and keep it separate from the actual imputation files.
+The file detailing the steps of selecting methods of imputation for the columns for 3 variables: Temperature, Acceleration, and Light. It is important to note that the purpose of this file is simply exploration of the reasoning behind the methods of imputation selected for later use; it is not intended to be the main file of imputation itself. This file reads in the original data set and creates several folders consisting of the data necessary for explanation of the models, as well as displays graphs showing the resulting “best” imputations. It is not necessary to run this file in order to run any files afterwards, ad it only provides explaination as to why certain imputation methods were chosen for certain columns.
 
 #### FillingAllNulls.qmd 
 File that takes the original .csv file and creates files for individual balloons, then creates new imputed and indicator columns. The resulting file is `AllNullsFilled.csv`.
@@ -54,7 +69,7 @@ File that takes the original .csv file and creates files for individual balloons
 This file contains information found at https://eclipse.gsfc.nasa.gov/SEpath/SEpath2001/SE2024Apr08Tpath.html, providing information about the location of the moon’s shadow at different times during the eclipse. Nothing need be done with this file - it is here to be read into cleaning moon.R
 
 #### cleaning moon.R 
-This file is responsible for most of the transformation of the original data found from NASA to the data processed and used by the interactive application. It reads in OriginalMoonData.csv, while outputting expanded_testingcleaningofmoon.csv.
+This file is responsible for most of the transformation of the original data found from NASA to the data processed and used by the interactive application. It reads in `OriginalMoonData.csv`, while outputting `expanded_testingcleaningofmoon.csv`.
 
 #### expanded_testingcleaningofmoon.csv 
 This is the data that is the result of `cleaning moon.R`, should you not desire to re-run the cleaning file and just run the app itself. Nothing needs to be done on the user side with this file.
