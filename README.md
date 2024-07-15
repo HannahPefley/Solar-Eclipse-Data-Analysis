@@ -4,7 +4,7 @@
 This repository contains the results of an 8-week period of research and analysis completed by three undergraduate students from Taylor University, during the summer of 2024. The team was presented with an outside data source, collected from weather balloons launched the day of the total solar eclipse on April 8th, 2024. The files here guide through the process of preprocessing the dataset, adding additional columns, performing analysis on the data, and developing deliverable results. 
 
 ## Data Availability
-As of the latest update to this repository, the data used to conduct this study is not publically available, and is thus not included with the files here. However, there is potential for it to be available upon request. 
+As of the latest update to this repository, the data used to conduct this study is not publically available, and is thus not included with the files here. However, there is potential for it to be available upon request. Anyone who would like access to the raw data can contact NearSpace Education at [nse@nearspaceeducation.org](mailto:nse@nearspaceeducation.org)
 
 ## Installations and setup
 This code was primarily written and made to run in an RStudio Environment, and thus the following packages may need to be installed:
