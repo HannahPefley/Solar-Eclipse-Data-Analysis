@@ -1,0 +1,212 @@
+Load the Necessary Libraries
+Hanah Pefley, Kristine Lee
+```{r}
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(car)
+```
+The goal here is exploration of  the effects of the eclipse on turbulence at a
+specific altitude. Tableau graphs detailing why these two balloons were chosen can
+be found in another file. Generally, these two balloons were selected due to the
+fact that they traveled along the most similar lat/lon paths, while one was the 
+only balloon that contained strictly data outside of the eclipse window, and the
+other represented a normal balloon launched during the eclipse. Here, we read in
+the original file derived from our null filling steps, and work from there to 
+compare the turbulence between the two balloons, checking if the variances are
+significantly different.
+```{r}
+mydata <- read_csv("../PreProcessing/AllNullsFilled.csv", show_col_types = FALSE)
+
+# Filter the data for "Eclipse Pod v2 - IMS Pre" and standardize AccelImputed
+pre_original <- mydata %>%
+  filter(Balloon == "Eclipse Pod v2 - IMS Pre") %>%
+  filter(Ascent == 1) %>%
+  mutate(accelStandardized = as.numeric(scale(AccelImputed)))
+
+# Filter the data for "Eclipse Pod v2 - IMS During" and standardize AccelImputed
+during_original <- mydata %>%
+  filter(Balloon == "Eclipse Pod v2 - IMS During") %>%
+  filter(Ascent == 1) %>%
+  mutate(accelStandardized = as.numeric(scale(AccelImputed)))
+
+combined_data_adjusted <- bind_rows(pre_original, during_original)
+
+# Filter the data for actual altitude between 60,000 and 70,000 feet - our area of interest
+filtered_data_combined <- combined_data_adjusted %>%
+  filter(ActualAltitudeInFeet >= 60000 & ActualAltitudeInFeet <= 70000)
+
+data_pre_filtered <- filtered_data_combined %>%
+  filter(Balloon == "Eclipse Pod v2 - IMS Pre")
+
+data_during_filtered <- filtered_data_combined %>%
+  filter(Balloon == "Eclipse Pod v2 - IMS During")
+
+# Check boxplots of the two balloons
+plot <- ggplot(filtered_data_combined, aes(x = as.factor(Balloon), y = accelStandardized)) +
+     geom_boxplot() +
+     labs(title = "Boxplot of accelStandardized by Balloon", x = "Balloon",
+          y = "accelStandardized") + theme_minimal()
+print(plot)
+
+# Check the standard deviations
+sd_pre <- sd(data_pre_filtered$accelStandardized, na.rm = TRUE)
+sd_during <- sd(data_during_filtered$accelStandardized, na.rm = TRUE)
+
+print(paste("Standard deviation of accelStandardized for 'Eclipse Pod v2 - IMS Pre':", sd_pre))
+print(paste("Standard deviation of accelStandardized for 'Eclipse Pod v2 - IMS During':", sd_during))
+
+# Checking for Normality
+shapiro.test(data_pre_filtered$accelStandardized)
+shapiro.test(data_during_filtered$accelStandardized)
+
+# Visual inspection of normality using QQ plots
+qqnorm(data_pre_filtered$accelStandardized)
+qqline(data_pre_filtered$accelStandardized, col = "blue")
+
+qqnorm(data_during_filtered$accelStandardized)
+qqline(data_during_filtered$accelStandardized, col = "blue")
+
+```
+We see that the data we have for "During" is not normally distributed - meaning we are unable to use the F-test.
+One alternative, as suggested by (https://www.quality-control-plan.com/StatGuide/ftest_alts.htm, https://datatab.net/tutorial/levene-test) and several additional sites, is Levene's test, which is less dependent on normality of data.
+```{r}
+# Perform Levene's Test to check for equal variances
+levene_test <- leveneTest(accelStandardized ~ factor(Balloon), data = filtered_data_combined)
+
+# Print the results
+print(levene_test)
+```
+We see now, from the results of the Levene's test that our P-value is less than a 0.05 significance level - and thus that we have strong evidence that the variances of the acceleration (turbulence) is significantly different between the two balloons.
+
+Now, we have worked to select two balloons that are very similar in most respects locationally - lat/long and altitude. Research done for several hours was unable to determine the exact wind patterns and such of these locations even regionally for this day. However, generally these altitudes are considered the lower stratosphere (https://www.noaa.gov/jetstream/atmosphere/layers-of-atmosphere), and though it was extremely difficult to find any solid information or numbers regarding average or predicted windspeeds at these heights, the general consensus seems that this range of height tends to be outside of areas where a lot of changes in wind activity are expected (https://www.weather.gov/source/zhu/ZHU_Training_Page/winds/Wx_Terms/Flight_Environment.htm). From this we may have some conjectures... but because of the inability to control other variables such as wind, etc we are unable to conclude solid cause and effect. The main difference between these two balloons in this case, aside from the different times they were launched, is the different percentage of coverage of the moon at the same coordinates and altitudes. The IMS Pre balloon reaches these heights around 12:55 pm - 1:02 pm, while the IMS During balloon reaches these heights at around 3:02pm-3:11pm. For the Pre balloon, the sun was not at all covered by the moon, and thus it was at no time in the shadow of the moon. However, the during balloon reached 100% coverage (totality) during this time at this location, and thus spent significant time in the shadow of the moon at this altitude. We believe that this key difference may be a notable potential factor in this significant difference of variances. Though we also do not have data from more balloons at this same altitude or similar coordinates to evaluate here, we can look for similar trends throughout the rest of our data. 
+
+# Expanding the conclusions
+```{r}
+#balloon_names <- unique(mydata$Balloon)
+balloon_names <- c("Eclipse Pod v2 - AMA Pre", "Eclipse Pod v2 - Eastbrook", 
+                   "Eclipse Pod v2 - GRCC", 
+                   "Eclipse Pod v2 - IMS Pre", "Eclipse Pod v2 - IMS During", 
+                   "Eclipse Pod v2 - IN Academy", "Eclipse Pod v2 - Linton-S", 
+                   "Eclipse Pod v2 - PFW Edu", "Eclipse Pod v2 - PFW Eng",
+                   "Eclipse Pod v2 - NSE Upland", 
+                   #"Eclipse Pod v2 - Stockbridge", #shouldn't be used because of curvy imputation
+                   "Eclipse Pod v2 - Taylor U")
+
+process_data <- function(input_file, output_file) {
+  mydata <- read_csv(input_file, show_col_types = FALSE)
+  processed_data_list <- list()
+  for (balloon in balloon_names) {
+    filtered_data <- mydata %>%
+      filter(Balloon == balloon) %>%
+      mutate(accelStandardized = as.numeric(scale(AccelImputed)),
+             ActualAlt = AltImputed * 3.28084)
+   #          ActualAlt = AltCombined * 3.28084)
+
+    processed_data_list[[balloon]] <- filtered_data
+  }
+  combined_data <- bind_rows(processed_data_list)
+  write_csv(combined_data, output_file)
+}
+
+#process_data("../PreProcessing/AllNullsFilled.csv", "combined_data_all.csv")
+process_data("AllNullsFilled.csv", "combined_data_all.csv")
+data <- read_csv("combined_data_all.csv", show_col_types = FALSE)
+```
+
+We began looking at the standard deviation of acceleration for each balloon before, during, and after totality. Several balloons were removed which had bad data, usually because there were few original data points which made the altitude imputation less accurate. 
+```{r}
+results <- data.frame(Balloon = character(), Phase = character(), SD = numeric(), stringsAsFactors = FALSE)
+for(balloon_name in balloon_names){
+  balloon_data <- data[data$Balloon == balloon_name, ]
+  totality_index <- which(balloon_data$totality == 1)
+  # Before totality
+  if(length(totality_index) > 0) {
+    first_totality_index <- totality_index[1]
+    before_totality_data <- balloon_data[1:(first_totality_index - 1), ]
+  } else {
+    before_totality_data <- balloon_data}
+  before_sd <- if(nrow(before_totality_data) > 0) sd(before_totality_data$accelStandardized) else NA
+  results <- rbind(results, data.frame(Balloon = balloon_name, Phase = "Before", SD = before_sd))
+  # During totality
+  during_totality_data <- balloon_data[balloon_data$totality == 1, ]
+  during_sd <- if(nrow(during_totality_data) > 0) sd(during_totality_data$accelStandardized) else NA
+  results <- rbind(results, data.frame(Balloon = balloon_name, Phase = "During", SD = during_sd))
+  # After totality
+  if(length(totality_index) > 0) {
+    last_totality_index <- totality_index[length(totality_index)]
+    after_totality_data <- balloon_data[(last_totality_index + 1):nrow(balloon_data), ]
+  } else {
+    after_totality_data <- data.frame() }
+  after_sd <- if(nrow(after_totality_data) > 0) sd(after_totality_data$accelStandardized) else NA
+  results <- rbind(results, data.frame(Balloon = balloon_name, Phase = "After", SD = after_sd))
+}
+results$Phase <- factor(results$Phase, levels = c("Before", "During", "After"))
+# Display the results
+print(results)
+# Visualization
+ggplot(results, aes(x = Balloon, y = SD, fill = Phase)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Variance of Acceleration Before, During, and After Totality",
+       x = "Balloon", y = "Variance of Acceleration")
+```
+For every balloon tested, except NSE Upland and GRCC, we can see that the standard deviation of acceleration is lower during totality. 
+We then narrowed the window to only account for data when the balloons were at an altitude between 60,000 and 70,000 feet, and were in the path of ascent in order to compare with the above IMS Pre and IMS During which were studied under that altitude. 
+```{r}
+data <-read_csv("AllNullsFilled.csv")
+balloon_names <- c("Eclipse Pod v2 - Eastbrook", 
+                   "Eclipse Pod v2 - IMS Pre", "Eclipse Pod v2 - IMS During", 
+                   "Eclipse Pod v2 - PFW Edu", 
+                   "Eclipse Pod v2 - NSE Upland", 
+                   "Eclipse Pod v2 - Taylor U")
+
+results <- data.frame(Balloon = character(), Phase = character(), SD = numeric(), stringsAsFactors = FALSE)
+for(balloon_name in balloon_names){
+  data_during <- data %>%
+    filter(Balloon == balloon_name) %>%
+    filter(ActualAlt >= 60000 & ActualAlt <= 70000 & PercentTotality <= 1 & PercentTotality > .9 & Ascent == 1)
+  
+  sd_during <- sd(data_during$accelStandardized, na.rm = TRUE)
+  results <- rbind(results, data.frame(Balloon = balloon_name, Phase = "Near/During", SD = sd_during))
+  
+  data_after <- data %>%
+    filter(Balloon == balloon_name) %>%
+    filter(ActualAlt >= 60000 & ActualAlt <= 70000 & PercentTotality <= .9 & Ascent == 1)
+  
+  sd_after <- sd(data_after$accelStandardized, na.rm = TRUE)
+  results <- rbind(results, data.frame(Balloon = balloon_name, Phase = "Before/After", SD = sd_after))
+
+  }
+results$Phase <- factor(results$Phase, levels = c("Near/During", "Before/After"))
+print(results)
+
+# Visualization
+ggplot(results, aes(x = Balloon, y = SD, fill = Phase)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Variance of Acceleration Before, During, and After Totality",
+       x = "Balloon", y = "Variance of Acceleration")
+```
+
+After filtering by altitude and ascent, we can see that most of the balloons are between 60,000 and 70,000 feet after they reach totality. There is still a varied range of variance, with most balloons reaching that altitude after totality has occurred. If we look back at the IMS Pre/During balloons, we see that at the same altitude and approximately the same location, the IMS During has a significantly lower standard deviation, likely caused by the eclipse. We notice that IMS Pre has a higher variance than the other balloons except Taylor U. We can conclude that there is some effect of the eclipse on the turbulence, seeing that the variance of the only balloon launched pre-eclipse is higher than most balloons launched during the eclipse.   
+```{r}
+#looking at those balloons without distinction of totality
+results <- data.frame(Balloon = character(), SD = numeric(), stringsAsFactors = FALSE)
+
+for(balloon_name in balloon_names){
+  balloon_data <- data[data$Balloon == balloon_name, ]
+  std <- sd(balloon_data[balloon_data$ActualAlt >= 60000 & balloon_data$ActualAlt <= 70000 & balloon_data$Ascent == 1, ]$accelStandardized)
+  results <- rbind(results, data.frame(Balloon = balloon_name, SD = std))
+}
+
+# Display the results
+print(results)
+
+# Visualization
+ggplot(results, aes(x = Balloon, y = SD)) +
+  geom_bar(stat = "identity", position = position_dodge(), fill = "skyblue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Variance of Acceleration Between 60,000 and 70,000 ft",
+       x = "Balloon", y = "Variance of Acceleration")
+```
