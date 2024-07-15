@@ -1,0 +1,890 @@
+---
+title: "COMPILED NULL CLEANING"
+author: "Hannah Pefley, Kristine Lee"
+output: pdf_document
+---
+# Important Information
+**This file will create all necessary files, important and exporting as it goes 
+along, except for the original data set '2024-04-08 NSE Eclipse.xlsx - Main.csv'.
+To run all code, please put this file (or a similar file) in its own folder,
+alongside the original data set. All necessary folders and files will be generated
+with the code included here. It is recommended to have a separate folder for this
+file for easier tracking of the information.**
+
+# Getting Started
+
+We first import all necessary libraries for the tasks of filtering our data, and
+formulating models for our null values
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(fs)
+library(readr)
+library(mosaic)
+library(dplyr)
+library(effsize)
+library(forecast)
+library(lmtest)
+library(readr)
+library(imputeTS)
+library(Metrics)
+library(caret)
+library(stringr)
+library(lubridate)
+library(VIM)
+library(brms)
+library(ggplot2)
+library(tidyr)
+
+dir_create("Individual file models")
+dir_create("Combined file models")
+```
+
+## Creating Testable Data
+
+In order to attempt to construct feasible models for filling in null values, we 
+first consider the three columns containing a null value every 11 rows - 
+`Light (lux)`, `Temperature (F)`, and `Acceleration (g)`. We can use similar 
+methods to construct potential models for these three columns of information. 
+We first take our original data set, and split it into individual .csv files by
+balloon:
+```{r}
+# Setting input and output directories and files
+output_dir<-"Individual Balloon Sheets"
+dir_create(output_dir)
+df <- read_csv('../2024-04-08 NSE Eclipse.xlsx - Main.csv', show_col_types = FALSE)
+balloons_of_interest <- unique(df$Balloon)
+
+# Filtering 
+df_filtered <- df %>% 
+  filter(Balloon %in% balloons_of_interest) %>%
+  mutate(`Packet Prefix` = str_split(`Packet ID`, '\\.', simplify = TRUE)[,1]) %>%
+  arrange(`Packet Prefix`, `Packet ID`)
+
+# Saving Files Individually
+for (balloon in balloons_of_interest) {
+  balloon_df <- df_filtered %>% filter(Balloon == balloon)
+  output_file <- file.path(output_dir, 
+                           paste0('sorted_', 
+                                  str_replace_all(balloon, 
+                                                  c(" " = "_", "-" = "_")), 
+                                  '.csv'))
+  write_csv(balloon_df, output_file)
+}
+```
+
+## Separating Data into "Training" and "Test" sets
+
+Now, we take these individual files and consider how we would like to test models
+we make as we construct our models. We propose that pulling the 9th packet value
+into a separate file, and removing the current null values from the original 
+balloon sheets - replacing the 9th values with null to create our training set,
+will allow us to test how well our models perform. We do so below. Through this,
+we are creating the folder `filtered data` (containing the individual balloon 
+sheets with the seq.9 value filled in as null, and with the seq.10 null rows 
+removed), `just9`, (which contains individual balloon sheets with just the 
+original seq.9 rows with the proper observed values per balloon): as well as two
+combined sheets of each of those folders (`combinedfiltered.csv` and `just9s.csv`
+respectively) that will later allow for us to compare our modeling results in a
+more efficient way.
+
+```{r}
+#Define the folder our individual sheets for each balloon are coming from, and 
+#the output folder we want our 14 test and 14 training sheets to go to individually
+input_folder <- "Individual Balloon Sheets"
+output_folder <- "Individual file models/filtered data"
+just9_folder <- "Individual file models/just9"
+dir_create(output_folder)
+dir_create(just9_folder)
+files <- dir_ls(input_folder)
+
+# Process each file of the 14 filtered files from our last step
+for (file in files) {
+  data <- read_csv(file, show_col_types = FALSE)
+  data_filtered <- data %>% filter(!str_ends(`Packet ID`, "primary"))
+  data_filtered <- data_filtered %>%
+    mutate_at(vars(`Light (lux)`, `Temperature (F)`, `Acceleration (g)`),
+              ~if_else(str_ends(`Packet ID`, "9"), NA_real_, .))
+  file_name <- path_file(file)
+  new_file_name <- paste0("filtered_", file_name)
+  write_csv(data_filtered, file.path(output_folder, new_file_name))
+  data_just9 <- data %>% filter(str_ends(`Packet ID`, "9"))
+  just9_file_name <- paste0("just9_", file_name)
+  write_csv(data_just9, file.path(just9_folder, just9_file_name))
+}
+
+#Export `combinedfiltered.csv` file with removed previous null item and nullified
+#9th packet item (THIS FILE IS JUST FOR CONVENIENCE - DOES NOT IMPACT CALCULATIONS)
+folderf_path <- "Individual file models/filtered data"
+filef_paths <- list.files(path = folderf_path, pattern = "\\.csv$", full.names = TRUE)
+combinedf_data <- bind_rows(read_csv(filef_paths, show_col_types=FALSE))
+write_csv(combinedf_data, file.path('Combined file models','combinedFiltered.csv'))
+
+#Export `just9s.csv` that contains just the packet number 9 item (THIS FILE IS 
+#JUST FOR CONVENIENCE - DOES NOT IMPACT CALCULATIONS)
+folder9_path <- "Individual file models/just9"
+file9_paths <- list.files(path = folder9_path, pattern = "\\.csv$", full.names = TRUE)
+combined9_data <- bind_rows(read_csv(file9_paths, show_col_types=FALSE))
+write_csv(combined9_data, file.path("Combined file models", "just9s.csv"))
+```
+# Constructing Models
+
+## Mean Modeling
+Now, we have our training files stored in the `filtered data` folder, as well as
+our eventual comparison files stored in the `just9` folder. Now, we can create 
+our models based on or training set, starting with means. Here we see the means
+of each packet are calculated, and then substituted for the seq.9 val in that 
+packet, storing them in additional columns `lightMean`, `tempMean`, and 
+`accelMean`. This code also exports the individual excel sheets with the seq.9 
+values into folder `MeanFilled`, as well as combines all of the processed files 
+into `combinedMeans.csv`. This code ends by then exporting  `onlynullsMeans.csv`
+which contains just the `Packet ID` as a distinct identifier for each row, as
+well as the predicted seq.9 (null) predictions.  
+
+```{r}
+calculate_avg_per_packet <- function(dataframe, column, packet_prefix) {
+  new_column <- case_when(
+    column == "Light (lux)" ~ "lightMean",
+    column == "Temperature (F)" ~ "tempMean",
+    column == "Acceleration (g)" ~ "accelMean",
+    TRUE ~ paste0(column, " Model")
+  )
+  dataframe %>%
+    group_by(!!sym(packet_prefix)) %>%
+    mutate(
+      !!new_column := if_else(is.na(!!sym(column)),
+                              mean(!!sym(column), na.rm = TRUE),
+                              NA_real_)
+    ) %>%
+    ungroup()
+}
+
+input_folder <- "Individual file models/filtered data"
+output_folder <- "Individual file models/MeanFilled"
+dir_create(output_folder)
+files <- dir_ls(input_folder, regexp = "\\.csv$")
+
+for (file in files) {
+  df <- read_csv(file, show_col_types = FALSE)
+  df <- df %>%
+    calculate_avg_per_packet('Light (lux)', 'Packet Prefix') %>%
+    calculate_avg_per_packet('Temperature (F)', 'Packet Prefix') %>%
+    calculate_avg_per_packet('Acceleration (g)', 'Packet Prefix')
+  
+  file_name <- path_file(file)
+  output_file_path <- file.path(output_folder, paste0("Processed_", file_name))
+  write_csv(df, output_file_path)
+}
+
+# Combine all processed files into one CSV
+processed_files <- dir_ls(output_folder, regexp = "\\.csv$")
+data_frames <- lapply(processed_files, function(file_path) {
+  read_csv(file_path, show_col_types = FALSE)
+})
+
+combined_data_means <- bind_rows(data_frames)
+combined_output_file <- "combinedMeans.csv"
+write_csv(combined_data_means, file.path("Combined file models", combined_output_file))
+
+non_null_df_means <- combined_data_means %>%
+  select(`Packet ID`, `lightMean`, `tempMean`, `accelMean`) %>%
+  drop_na()
+non_null_output_file <- "onlynullsMeans.csv"
+write_csv(non_null_df_means, file.path("Combined file models", non_null_output_file))
+```
+
+## "Rate of Change" Modeling
+Now, we move onto constructing a model based on the "rate of change" of the rows
+surrounding null rows. For null values with values on either side, we simply 
+calculate a weighted average for the rate of change and apply it. For values 
+missing values before or after, we simply check for the rate of the values 
+directly after or before respectively, and weight accordingly. We also finish
+by similarly sorting out the original data with the added columns in the folder
+`ROCFilled`, as well as the combined data `combinedROC.csv`, and the combined 
+data consisting strictly of the null predictions `onlynullsROC.csv`.
+
+```{r}
+fill_null_with_rate <- function(data) {
+  new_data <- data
+  new_data <- cbind(new_data,
+                    lightROC = NA,
+                    tempROC = NA,
+                    accelROC = NA)
+    for (col in c("Light (lux)", "Temperature (F)", "Acceleration (g)")) {
+      null_indices <- which(is.na(data[[col]]))
+      for (i in null_indices) {
+        next_val <- data[[col]][i + 1]
+        prev_val <- data[[col]][i - 1]
+        if (is.na(prev_val)){
+          total_time <- as.numeric(data$Timestamp[i + 3] - data$Timestamp[i + 1])
+          if (total_time == 0){
+            total_time <- 4
+          }
+          extra_next_val <- data[[col]][i + 3]
+          dif_of_vals <- extra_next_val - next_val
+          rate_of_change <- dif_of_vals / total_time
+          null_val<- next_val - ((data$Timestamp[i + 1]-data$Timestamp[i])*rate_of_change)
+        }else if (is.na(next_val)){
+          total_time <- as.numeric(data$Timestamp[i - 3] - data$Timestamp[i - 1])
+          if (total_time == 0){
+            total_time <- 4
+          }
+          extra_prev_val <- data[[col]][i - 3]
+          dif_of_vals <- prev_val - extra_prev_val
+          rate_of_change <- dif_of_vals / total_time
+          null_val <- prev_val +(2*rate_of_change)
+        }else{
+          total_time <- as.numeric(data$Timestamp[i + 1] - data$Timestamp[i - 1])
+          if (total_time == 0){
+            total_time <- 4
+          }
+          dif_of_vals <- next_val - prev_val
+          rate_of_change <- dif_of_vals / total_time
+          null_val <- prev_val + (2 * rate_of_change)
+        }
+        if (col == "Light (lux)") {
+          new_data[["lightROC"]][i] <- null_val
+        } else if (col == "Temperature (F)") {
+          new_data[["tempROC"]][i] <- null_val
+        } else {
+          new_data[["accelROC"]][i] <- null_val
+        }
+      }
+    }
+  return(new_data)
+}
+folder_path <- "Individual file models/filtered data"
+output_folder <- "Individual file models/ROCFilled"
+dir_create(output_folder)
+file_paths <- list.files(path = folder_path, pattern = ".csv$", full.names = TRUE)
+for (file_path in file_paths) {
+  data <- read_csv(file_path, show_col_types = FALSE)
+  filled_data <- fill_null_with_rate(data)
+  new_file_path <- file.path(output_folder, paste0("filled_", basename(file_path)))
+  write_csv(filled_data, new_file_path)
+}
+
+file_paths <- list.files(path = output_folder, pattern = "\\.csv$", full.names = TRUE)
+data_frames <-  read_csv(file_paths, show_col_types = FALSE)
+combined_data_ROC <- bind_rows(data_frames)
+write_csv(combined_data_ROC, file.path("Combined file models","combinedROC.csv"))
+non_null_df_ROC <- combined_data_ROC %>%
+  select(`Packet ID`, lightROC, accelROC, tempROC) %>%
+  na.omit()
+write_csv(non_null_df_ROC, file.path("Combined file models", "onlynullsROC.csv"))
+```
+
+
+
+## Linear Regression Model
+We now can make a regressive model. This type of model will be used to form 
+smaller regressive models based on the two packets surrounding each null value 
+that will predict the null value. It also reads out the original data with the 
+added columns in the folder `processedREGRESSION_balloon_data`, as well as the 
+combined data `combinedRegression_balloon_data.csv`, and the combined data 
+consisting strictly of the null predictions `onlynullsReg.csv`.
+
+```{r}
+timestamp_to_seconds <- function(timestamp) {
+  components <- strsplit(timestamp, ":")[[1]] 
+  hours <- as.numeric(components[1])
+  minutes <- as.numeric(components[2])
+  seconds <- as.numeric(components[3])
+  total_seconds <- (hours * 3600) + (minutes * 60) + seconds
+return(total_seconds)
+}
+
+process_balloon_data <- function(file_path, output_path) {
+  miniDataEclipse <- read_csv(file_path, show_col_types = FALSE)
+  packet_prefx<-unique(miniDataEclipse$`Packet Prefix`)
+  balloonsDS <- miniDataEclipse
+  balloonsDS <- cbind(balloonsDS, tempReg=NA, lightReg=NA, accelReg=NA)
+  balloonsDS$TimestampinSecs <- sapply(as.character(balloonsDS$Timestamp), 
+                                       timestamp_to_seconds)
+  
+  null_indices_temp <- which(is.na(balloonsDS[["Temperature (F)"]]))
+  for (i in null_indices_temp){
+    nullvalpref <- balloonsDS$`Packet Prefix`[i]
+    nextvalpref <- packet_prefx[(which(packet_prefx==nullvalpref)+1)]
+    modelsubset<- modelsubset <- balloonsDS %>%
+      filter(`Packet Prefix` %in% c(nullvalpref, nextvalpref))
+      
+    regmodel <- lm(`Temperature (F)`~TimestampinSecs+I(TimestampinSecs^2)
+                     +I(TimestampinSecs^3)+I(TimestampinSecs^4),
+                   data=modelsubset)
+    
+    predicted_value <- predict(regmodel, newdata = 
+                                   data.frame(TimestampinSecs = 
+                                                balloonsDS$TimestampinSecs[i]))
+    balloonsDS$`tempReg`[i] <- predicted_value
+  }
+  
+  null_indices_accel <- which(is.na(balloonsDS[["Acceleration (g)"]]))
+  for (i in null_indices_accel){
+    nullvalpref <- balloonsDS$`Packet Prefix`[i]
+    nextvalpref <- packet_prefx[(which(packet_prefx==nullvalpref)+1)]
+    modelsubset <- modelsubset <- balloonsDS %>%
+      filter(`Packet Prefix` %in% c(nullvalpref, nextvalpref))
+    
+    regmodel <- lm(`Acceleration (g)`~TimestampinSecs+I(TimestampinSecs^2)
+                   +I(TimestampinSecs^3)+I(TimestampinSecs^4), data=modelsubset)
+    
+    predicted_value <- predict(regmodel, newdata = 
+                                 data.frame(TimestampinSecs = 
+                                              balloonsDS$TimestampinSecs[i]))
+    balloonsDS$`accelReg`[i] <- predicted_value
+  }
+  
+  null_indices_light <- which(is.na(balloonsDS[["Light (lux)"]]))
+  for (i in null_indices_light){
+    nullvalpref <- balloonsDS$`Packet Prefix`[i]
+    nextvalpref <- packet_prefx[(which(packet_prefx==nullvalpref)+1)]
+    modelsubset <- modelsubset <- balloonsDS %>% 
+      filter(`Packet Prefix` %in% c(nullvalpref, nextvalpref))
+    
+    regmodel <- lm(`Light (lux)`~TimestampinSecs+I(TimestampinSecs^2)
+                   +I(TimestampinSecs^3)+I(TimestampinSecs^4), data=modelsubset)
+    
+    predicted_value <- predict(regmodel, newdata = 
+                                 data.frame(TimestampinSecs = 
+                                              balloonsDS$TimestampinSecs[i]))
+    
+    balloonsDS$`lightReg`[i] <- predicted_value
+  }
+  
+  write_csv(balloonsDS, file = output_path)}
+
+input_files<-list.files(path = "Individual file models/filtered data", pattern =
+                          ".csv$", full.names = TRUE)
+output_dir <- "Individual file models/RegFilled"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+for (file in input_files) {
+  output_file <- file.path(output_dir, paste0("processedREG_", basename(file)))
+  process_balloon_data(file, output_file)
+}
+
+file_paths <- list.files(path = output_dir, pattern = "\\.csv$", 
+                         full.names = TRUE)
+data_frames <-  read_csv(file_paths, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data, file.path("Combined file models", "combinedReg.csv"))
+
+non_null_df <- combined_data %>%
+  select(`Packet ID`, tempReg, lightReg, accelReg) %>%
+  na.omit()
+write_csv(non_null_df, file.path("Combined file models", "onlynullsReg.csv"))
+```
+
+## K-Nearest Neighbors
+Next, we use KNN to impute our null values.
+
+```{r}
+perform_knn_imputation <- function(input_file) {
+  data2 <- read_csv(input_file, show_col_types = FALSE)
+  data2$TimestampinSecs <- sapply(as.character(data2$Timestamp), timestamp_to_seconds)
+  impute2_cols <- c('Light (lux)', 'Temperature (F)', 'Acceleration (g)')
+  data2[impute2_cols] <- kNN(data2, variable = impute2_cols, k = 5, 
+                             dist_var = 
+                               c("TimestampinSecs", "Packet Prefix"))[impute2_cols]
+  return(data2)
+}
+
+input_folder <- "Individual file models/filtered data"
+output_folder <- "Individual file models/KNNFilled"
+dir.create(output_folder, showWarnings = FALSE)
+files <- list.files(input_folder, full.names = TRUE)
+
+for (file in files){
+   output_data2 <- perform_knn_imputation(file)
+   file_name <- tools::file_path_sans_ext(basename(file))
+   predicted2_seq9 <- output_data2 %>% filter(grepl("seq\\.9$", `Packet ID`))
+   colnames(predicted2_seq9)[colnames(predicted2_seq9) == "Acceleration (g)"] <- "accelKNN"
+   colnames(predicted2_seq9)[colnames(predicted2_seq9) == "Temperature (F)"] <- "tempKNN"
+   colnames(predicted2_seq9)[colnames(predicted2_seq9) == "Light (lux)"] <- "lightKNN"
+   write_csv(predicted2_seq9, file.path(output_folder, paste0("KNN_filled_", file_name, ".csv")))
+}
+
+file_paths <- list.files(path = output_folder, pattern = "\\.csv$", full.names = TRUE)
+data_frames <-  read_csv(file_paths, show_col_types = FALSE)
+combined_data <- bind_rows(data_frames)
+write_csv(combined_data, file.path("Combined file models","combinedKNN.csv"))
+
+non_null_df <- combined_data %>%
+  select(`Packet ID`, tempKNN, lightKNN, accelKNN) %>%
+  na.omit()
+write_csv(non_null_df, file.path("Combined file models", "onlynullsKNN.csv"))
+```
+
+## Bayesian Regression
+Now we perform Bayesian Regression to fill in null values. (commented out to maintain efficient run-times)
+
+```{r,  warning=FALSE, message=FALSE}
+# process_balloon_data <- function(file_path, output_path) {
+#   miniDataEclipse <- read_csv(file_path, show_col_types = FALSE)
+#   miniDataEclipse$TimestampinSecs <- sapply(as.character(miniDataEclipse$Timestamp), 
+#                                             timestamp_to_seconds)
+#   
+#   colnames(miniDataEclipse)[colnames(miniDataEclipse) == "Temperature (F)"] <- "Temperature_F"
+#   colnames(miniDataEclipse)[colnames(miniDataEclipse) == "Acceleration (g)"] <- "Acceleration_g"
+#   colnames(miniDataEclipse)[colnames(miniDataEclipse) == "Light (lux)"] <- "Light_lux"
+#   
+#   temp_model <- brm(Temperature_F ~ TimestampinSecs, data = miniDataEclipse, 
+#                     family = gaussian(), 
+#                     chains = 2, cores = 2, iter = 2000)
+#   
+#   accel_model <- brm(Acceleration_g ~ TimestampinSecs, data = miniDataEclipse, 
+#                      family = gaussian(), 
+#                      chains = 2, cores = 2, iter = 2000)
+#   
+#   light_model <- brm(Light_lux ~ TimestampinSecs, data = miniDataEclipse, 
+#                      family = gaussian(), 
+#                      chains = 2, cores = 2, iter = 2000)
+#   
+#   temp_pred <- fitted(temp_model)
+#   accel_pred <- fitted(accel_model)
+#   light_pred <- fitted(light_model)
+#   
+#   miniDataEclipse$temp_imputed <- ifelse(is.na(miniDataEclipse$Temperature_F), 
+#                                          temp_pred, NA)
+#   miniDataEclipse$accel_imputed <- ifelse(is.na(miniDataEclipse$Acceleration_g), 
+#                                           accel_pred, NA)
+#   miniDataEclipse$light_imputed <- ifelse(is.na(miniDataEclipse$Light_lux), 
+#                                           light_pred, NA)
+#   
+#   colnames(miniDataEclipse)[colnames(miniDataEclipse) == "Temperature_F"] <- "Temperature (F)"
+#   colnames(miniDataEclipse)[colnames(miniDataEclipse) == "Acceleration_g"] <- "Acceleration (g)"
+#   colnames(miniDataEclipse)[colnames(miniDataEclipse) == "Light_lux"] <- "Light (lux)"
+#   
+#   write_csv(miniDataEclipse, file.path(output_path, basename(file_path)))
+# }
+# 
+# input_files <- list.files(path = "Individual file models/filtered data", 
+#                           pattern = ".csv$", full.names = TRUE)
+# output_dir <- "Individual file models/BayRegFilled"
+# dir.create(output_dir)
+# 
+# for (file in input_files) {
+#   process_balloon_data(file, output_dir)
+# }
+# 
+# file_paths <- list.files(path = output_dir, pattern = "\\.csv$", 
+#                          full.names = TRUE)
+# data_frames <-  read_csv(file_paths, show_col_types = FALSE)
+# combined_data <- bind_rows(data_frames)
+# write_csv(combined_data, file.path("Combined file models", "combinedBayReg.csv"))
+# 
+# non_null_df <- combined_data %>%
+#   select(`Packet ID`, temp_imputed, light_imputed, accel_imputed) %>%
+#   na.omit()
+# write_csv(non_null_df, file.path("Combined file models", "onlynullsBayReg.csv"))
+```
+
+# Joining Model Data
+
+## Individual Balloons
+Now, we are going to take all of our balloon sheets with the individual predictions 
+and condense them into one file per balloon
+```{r}
+
+original_folder <- "Individual Balloon Sheets"
+original_files <- list.files(original_folder)
+
+roc_folder <- "Individual file models/ROCFilled"
+reg_folder <- "Individual file models/RegFilled"
+mean_folder <- "Individual file models/MeanFilled"
+knn_folder <- "Individual file models/KNNFilled"
+#bayreg_folder <- "Individual file models/BayRegFilled"
+thenines_folder <- "Individual file models/just9"
+
+IndivPred <- "filteredIndividualPredictions"
+dir.create(IndivPred, showWarnings = FALSE)
+
+matched_up_predictions_folder <- "matched_up_predictions"
+dir.create(matched_up_predictions_folder, showWarnings = FALSE)
+
+
+for (original_file in original_files) {
+  megafile <- NULL
+  #for (folder_path in c(roc_folder, reg_folder, mean_folder, thenines_folder, 
+#                        knn_folder, bayreg_folder)) {
+  for (folder_path in c(roc_folder, reg_folder, mean_folder, thenines_folder, 
+                        knn_folder)) {  
+    folder_files <- list.files(folder_path)
+    for (file_name in folder_files){
+      file_path <- file.path(folder_path, file_name)
+      file_data <- read_csv(file_path, show_col_types = FALSE)
+      file_data$`Packet ID` <- as.character(file_data$`Packet ID`)
+      if (str_detect(file_name, paste0(original_file, "$"))) {
+        if(is.null(megafile)) {
+          megafile <- file_data
+         }else {
+        megafile <- left_join(megafile, file_data, by="Packet ID")
+         }
+      }
+    }
+  }
+  
+  megafile <- megafile[, c("Packet ID", "Balloon.y.y", "Light (lux).y.y",	
+                           "Temperature (F).y.y",	"Acceleration (g).y.y", 
+                           "tempReg", "lightReg", "accelReg", "lightROC", 
+                           "tempROC", "accelROC", "lightMean", "tempMean", 
+                           "accelMean", "tempKNN", "accelKNN", "lightKNN")#, 
+                           #"temp_imputed", "accel_imputed","light_imputed")
+                       ]
+  
+  colnames(megafile)[colnames(megafile) == "Balloon.y.y"] <- "Balloon"
+  colnames(megafile)[colnames(megafile) == "Light (lux).y.y"] <- "Light (lux)"
+  colnames(megafile)[colnames(megafile) == "Temperature (F).y.y"] <- "Temperature (F)"
+  colnames(megafile)[colnames(megafile) == "Acceleration (g).y.y"] <- "Acceleration (g)"
+ # colnames(megafile)[colnames(megafile) == "temp_imputed"] <- "tempBay"
+ # colnames(megafile)[colnames(megafile) == "accel_imputed"] <- "accelBay"
+ # colnames(megafile)[colnames(megafile) == "light_imputed"] <- "lightBay"
+  
+  megafile_filtered <- megafile[grepl("seq\\.9$", megafile$`Packet ID`), ]
+  filename_without_prefix <- sub(".*v2___", "", original_file)
+  
+  csv_file_path <- file.path(matched_up_predictions_folder, paste0(filename_without_prefix))
+  write_csv(megafile, csv_file_path)
+  
+  csv_file_path <- file.path(IndivPred, paste0(filename_without_prefix))
+  write_csv(megafile_filtered, csv_file_path)
+}
+```
+
+## All balloons
+
+We also do this for every file in order to create one large file to compare all 
+models for all balloons at once 
+```{r}
+Nines <- read_csv("Combined file models/just9s.csv", show_col_types=FALSE)
+RateOfChange <- read_csv("Combined file models/onlynullsROC.csv", show_col_types=FALSE)
+Regression <- read_csv("Combined file models/onlynullsReg.csv", show_col_types=FALSE)
+Means <- read_csv("Combined file models/onlynullsMeans.csv", show_col_types=FALSE)
+KNN <- read_csv("Combined file models/onlynullsKNN.csv", show_col_types = FALSE)
+#BayReg <- read_csv("Combined file models/onlynullsBayReg.csv", show_col_types = FALSE)
+
+Nines$`Packet ID` <- as.character(Nines$`Packet ID`)
+RateOfChange$`Packet ID` <- as.character(RateOfChange$`Packet ID`)
+Regression$`Packet ID` <- as.character(Regression$`Packet ID`)
+Means$`Packet ID` <- as.character(Means$`Packet ID`)
+KNN$`Packet ID` <- as.character(KNN$`Packet ID`)
+#BayReg$`Packet ID` <- as.character(BayReg$`Packet ID`)
+
+joined <- tibble( 
+  `Packet ID` = Nines$`Packet ID`,
+  `Balloon` = Nines$Balloon,
+  `Timestamp` = Nines$Timestamp,
+  `Light (lux)` = Nines$`Light (lux)`,
+  `Temperature (F)` = Nines$`Temperature (F)`,
+  `Acceleration (g)` = Nines$`Acceleration (g)`
+)
+joined <- left_join(joined, RateOfChange, by = "Packet ID")
+joined <- left_join(joined, Regression, by = "Packet ID")
+joined <- left_join(joined, Means, by = "Packet ID")
+joined <- left_join(joined, KNN, by = "Packet ID")
+#joined <- left_join(joined, BayReg, by = "Packet ID")
+
+ # colnames(joined)[colnames(joined) == "temp_imputed"] <- "tempBay"
+ # colnames(joined)[colnames(joined) == "accel_imputed"] <- "accelBay"
+ # colnames(joined)[colnames(joined) == "light_imputed"] <- "lightBay"
+
+write.csv(joined, file = "comparingNullsFinal.csv", row.names = FALSE)
+```
+
+# Determind the Best Model 
+
+## By Balloon
+Finally, we now want to compare our predictions to evaluate what model may be 
+the best for each column. We do so below, (`ComparingNullPredictors.Rmd`). We 
+test using $MSE$, $MAE$, and $R^{2}$, print the output of each, then calculate 
+which is the "best" model for each column for each test. This will allow us to 
+decide which model we would like to use for each column moving forward to fill 
+in the null values of our data set. 
+
+```{r}
+original_folder <- "filteredIndividualPredictions"
+output_filename <- "comparision_results.csv"
+
+prediction_files <- list.files(original_folder)
+  
+compiled <- tibble(
+  `Balloon` = character(),
+  `Test Type` = character(),
+  `tempReg` = numeric(), 
+  `lightReg` = numeric(),
+  `accelReg` = numeric(),
+  `tempROC` = numeric(),
+  `lightROC` = numeric(),
+  `accelROC` = numeric(),
+  `tempmean` = numeric(), 
+  `lightmean` = numeric(),
+  `accelmean` = numeric(),
+  `tempKNN` = numeric(),
+  `lightKNN` = numeric(),
+  `accelKNN` = numeric() #,
+ # `tempBay` = numeric(),
+ # `lightBay` = numeric(),
+ # `accelBay` = numeric()
+)
+
+ for (file in prediction_files){
+   file_path <- file.path(original_folder, file)
+   joined <- read_csv(file_path, show_col_types = FALSE) 
+
+  mae_temp_reg <- mae(joined$`Temperature (F)`, joined$tempReg)
+  mae_light_reg <- mae(joined$`Light (lux)`, joined$lightReg)
+  mae_accel_reg <- mae(joined$`Acceleration (g)`, joined$accelReg)
+  
+  mae_temp_roc <- mae(joined$`Temperature (F)`, joined$tempROC)
+  mae_light_roc <- mae(joined$`Light (lux)`, joined$lightROC)
+  mae_accel_roc <- mae(joined$`Acceleration (g)`, joined$accelROC)
+  
+  mae_temp_mean <- mae(joined$`Temperature (F)`, joined$`tempMean`)
+  mae_light_mean <- mae(joined$`Light (lux)`, joined$`lightMean`)
+  mae_accel_mean <- mae(joined$`Acceleration (g)`, joined$`accelMean`)
+  
+  mae_temp_knn <- mae(joined$`Temperature (F)`, joined$`tempKNN`)
+  mae_light_knn <- mae(joined$`Light (lux)`, joined$`lightKNN`)
+  mae_accel_knn <- mae(joined$`Acceleration (g)`, joined$`accelKNN`)
+  
+ # mae_temp_bay <- mae(joined$`Temperature (F)`, joined$`tempBay`)
+ # mae_light_bay <- mae(joined$`Light (lux)`, joined$`lightBay`)
+ # mae_accel_bay <- mae(joined$`Acceleration (g)`, joined$`accelBay`)
+  
+  test_type<-"MAE"
+
+  new_row <- tibble(
+    `Balloon` = joined$Balloon[1],
+    `Test Type` = test_type,
+    `tempReg` = mae_temp_reg, 
+    `lightReg` = mae_light_reg,
+    `accelReg` = mae_accel_reg,
+    `tempROC` = mae_temp_roc,
+    `lightROC` = mae_light_roc,
+    `accelROC` = mae_accel_roc,
+    `tempmean` = mae_temp_mean,
+    `lightmean` = mae_light_mean,
+    `accelmean` = mae_accel_mean,
+    `tempKNN` = mae_temp_knn,
+    `lightKNN` = mae_light_knn,
+    `accelKNN` = mae_accel_knn #,
+  #  `tempBay` = mae_temp_bay,
+ # `lightBay` = mae_light_bay,
+ # `accelBay` = mae_accel_bay
+  )
+  compiled <- bind_rows(compiled, new_row)
+}
+write_csv(compiled, output_filename)
+```
+
+## Overall Best 
+For all balloons together
+```{r}
+
+joined <- read_csv("comparingNullsFinal.csv", show_col_types = FALSE)
+
+mae_temp_roc <- mae(joined$`Temperature (F)`, joined$tempROC)
+mae_temp_reg <- mae(joined$`Temperature (F)`, joined$tempReg)
+mae_temp_mean <- mae(joined$`Temperature (F)`, joined$tempMean)
+mae_temp_knn <- mae(joined$`Temperature (F)`, joined$tempKNN)
+#mae_temp_bay <- mae(joined$`Temperature (F)`, joined$tempBay)
+
+mae_accel_roc <- mae(joined$`Acceleration (g)`, joined$accelROC)
+mae_accel_reg <- mae(joined$`Acceleration (g)`, joined$accelReg)
+mae_accel_mean <- mae(joined$`Acceleration (g)`, joined$accelMean)
+mae_accel_knn <- mae(joined$`Acceleration (g)`, joined$accelKNN)
+#mae_accel_bay <- mae(joined$`Acceleration (g)`, joined$accelBay)
+
+mae_light_roc <- mae(joined$`Light (lux)`, joined$lightROC)
+mae_light_reg <- mae(joined$`Light (lux)`, joined$lightReg)
+mae_light_mean <- mae(joined$`Light (lux)`, joined$lightMean)
+mae_light_knn <- mae(joined$`Light (lux)`, joined$lightKNN)
+#mae_light_bay <- mae(joined$`Light (lux)`, joined$lightBay)
+
+
+cat(
+  "MAE for Temp\n",
+  "tempROC = ", mae_temp_roc, "\n",
+  "tempReg = ", mae_temp_reg, "\n",
+  "tempMean = ", mae_temp_mean, "\n",
+  "tempKNN = ", mae_temp_knn, "\n",
+ # "tempBay = ", mae_temp_bay, "\n\n",
+  
+  "MAE for Accel\n",
+  "accelROC = ", mae_accel_roc, "\n",
+  "accelReg = ", mae_accel_reg, "\n",
+  "accelMean = ", mae_accel_mean, "\n",
+  "accelKNN = ", mae_accel_knn, "\n",
+  #"accelBay = ", mae_accel_bay, "\n\n",
+
+  "MAE for Light\n",
+  "lightROC = ", mae_light_roc, "\n",
+  "lightReg = ", mae_light_reg, "\n",
+  "lightMean = ", mae_light_mean, "\n",
+  "lightKNN = ", mae_light_knn, "\n",
+ # "lightBay = ", mae_light_bay, "\n\n",
+  sep = ""
+)
+
+# best_temp_val <- min(mae_temp_roc, mae_temp_reg, mae_temp_mean, mae_temp_knn, mae_temp_bay)
+# best_mae_model_temp <- which.min(c(mae_temp_roc, mae_temp_reg, mae_temp_mean, mae_temp_knn, mae_temp_bay))
+best_temp_val <- min(mae_temp_roc, mae_temp_reg, mae_temp_mean, mae_temp_knn)
+best_mae_model_temp <- which.min(c(mae_temp_roc, mae_temp_reg, mae_temp_mean, mae_temp_knn))
+
+if (best_mae_model_temp == 1) {
+  best_model_name <- "tempROC"
+} else if (best_mae_model_temp == 2) {
+  best_model_name <- "tempReg"
+} else if(best_mae_model_temp == 3) {
+  best_model_name <- "tempMean"
+} else if(best_mae_model_temp == 4){
+    best_model_name <- "tempKNN"
+} #else{
+ # best_model_name <- "tempBay"
+#}
+
+cat("The best model by mae for Temp is", best_model_name, "at", best_temp_val, "\n")
+
+# best_accel_val <- min(mae_accel_roc, mae_accel_reg, mae_accel_mean, mae_accel_knn, mae_accel_bay)
+# best_mae_model_accel <- which.min(c(mae_accel_roc, mae_accel_reg, mae_accel_mean, mae_accel_knn, mae_accel_bay))
+best_accel_val <- min(mae_accel_roc, mae_accel_reg, mae_accel_mean, mae_accel_knn)
+best_mae_model_accel <- which.min(c(mae_accel_roc, mae_accel_reg, mae_accel_mean, mae_accel_knn))
+
+if (best_mae_model_accel == 1) {
+    best_model_name <- "accelROC"
+  } else if (best_mae_model_accel == 2) {
+    best_model_name <- "accelReg"
+  } else if(best_mae_model_accel == 3){
+    best_model_name <- "accelMean"
+  } else if(best_mae_model_accel == 4){
+    best_model_name <- "accelKNN"
+  } #else{
+    #best_model_name <- "accelBay"
+ # }
+
+cat("The best model by mae for Accel is", best_model_name, "at", best_accel_val, "\n")
+
+# best_light_val <- min(mae_light_roc, mae_light_reg, mae_light_mean, mae_light_knn, mae_light_bay)
+# best_mae_model_light <- which.min(c(mae_light_roc, mae_light_reg, mae_light_mean, mae_light_knn, mae_light_bay))
+best_light_val <- min(mae_light_roc, mae_light_reg, mae_light_mean, mae_light_knn)
+best_mae_model_light <- which.min(c(mae_light_roc, mae_light_reg, mae_light_mean, mae_light_knn))
+
+if (best_mae_model_light == 1) {
+    best_model_name <- "lightROC"
+  } else if (best_mae_model_light == 2) {
+    best_model_name <- "lightReg"
+  } else if (best_mae_model_light == 3) {
+    best_model_name <- "lightMean"
+  } else if (best_mae_model_light == 4){
+    best_model_name <- "lightKNN"
+  }# else {
+   # best_model_name <- "lightBay"
+ # }
+
+cat("The best model by mae for light is", best_model_name, "at", best_light_val, "\n")
+```
+# Conclusions
+All in all, we see that the best prediction model for `Temperature (F)` is KNN,
+for `Acceleration (g)` is Mean, and for `Light (lux)` is KNN.
+We can now use these modeling techniques for each column respectively to fill in 
+the end of packet null values present in our original set, along with potentially
+filling in the seconds missing in between our data set.
+
+
+#TRUE NULLS
+
+Now, since we have our methods of prediction, we are going to use each of the 
+best models to fill in the true nulls found in our dataset. We will start with 
+`Temperature (F)` and `Light (lux)`, filling in with KNN.
+```{r}
+templight_knn_imputation <- function(input_file) {
+  data3 <- read_csv(input_file, show_col_types = FALSE)
+  data3$TimestampinSecs <- sapply(as.character(data3$Timestamp), timestamp_to_seconds)
+  impute3_cols <- c('Light (lux)', 'Temperature (F)')
+  imputed_data <- kNN(data3, variable = impute3_cols, k = 5, dist_var = c("TimestampinSecs", "Packet Prefix"))
+  data3$LightKNN <- ifelse(is.na(data3$`Light (lux)`), imputed_data$`Light (lux)`, NA)
+  data3$TempKNN <- ifelse(is.na(data3$`Temperature (F)`), imputed_data$`Temperature (F)`, NA)
+  return(data3)
+}
+
+input_folder <- "Individual Balloon Sheets"
+output_folder <- "2PredNulls"
+dir.create(output_folder, showWarnings = FALSE)
+files <- list.files(input_folder, full.names = TRUE)
+
+for (file in files) {
+  output_data3 <- templight_knn_imputation(file)
+  file_name <- tools::file_path_sans_ext(basename(file))
+  write_csv(output_data3, file.path(output_folder, paste0("Nulls_filled_", file_name, ".csv")))
+}
+
+
+```
+
+
+Now we take these files and fill in the Acceleration with the mean
+```{r}
+calculate_accel_avg_per_packet <- function(dataframe, packet_prefix) {
+  new_column <- "AccelMean"
+  dataframe %>% group_by(!!sym(packet_prefix)) %>% mutate(
+      !!new_column := if_else(is.na(`Acceleration (g)`),
+                              mean(`Acceleration (g)`, na.rm = TRUE),
+                              NA_real_)) %>% ungroup()
+}
+
+input_folder <- "2PredNulls"
+output_folder <- "AllNulls"
+dir_create(output_folder)
+files <- dir_ls(input_folder, regexp = "\\.csv$")
+
+for (file in files) {
+  df <- read_csv(file, show_col_types = FALSE)
+  df <- df %>% calculate_accel_avg_per_packet('Packet Prefix')
+  file_name <- path_file(file)
+  output_file_path <- file.path(output_folder, paste0("filledNulls_", file_name))
+  write_csv(df, output_file_path)
+}
+
+processed_files <- dir_ls(output_folder, regexp = "\\.csv$")
+data_frames <- lapply(processed_files, function(file_path) {
+  read_csv(file_path, show_col_types = FALSE)
+})
+
+combined_data_means <- bind_rows(data_frames)
+combined_output_file <- "ExplainingImputations.csv"
+write_csv(combined_data_means, combined_output_file)
+
+```
+
+We can visualize How these values are being imputed:
+
+```{r}
+file_paths <- list.files(path = "AllNulls", pattern = "*.csv", full.names = TRUE)
+
+
+for (file in file_paths){
+  data <- read_csv(file)
+  data$Timestamp <- paste("2024-04-08", data$Timestamp)
+  data$Timestamp <- as.POSIXct(data$Timestamp, format = "%Y-%m-%d %H:%M:%S")
+  
+  
+  tempPlot <- plot(data$Timestamp, data$`Temperature (F)`, col='red', main = paste0("Imputed External Temperature for ", unique(data$Balloon)), pch = 16)
+  points(data$Timestamp, data$`TempKNN`, col='blue', pch=16)
+  
+  accelPlot <- plot(data$Timestamp, data$`Acceleration (g)`, col='red', main = paste0("Imputed Acceleration for ", unique(data$Balloon)), pch = 16)
+  points(data$Timestamp, data$`AccelMean`, col='blue', pch=16)
+  
+  lightPlot <- plot(data$Timestamp, data$`Light (lux)`, col='red', main = paste0("Imputed Light for ", unique(data$Balloon)), pch = 16)
+  points(data$Timestamp, data$`LightKNN`, col='blue', pch=16)
+  
+  print(tempPlot)
+  print(lightPlot)
+  print(accelPlot)
+  
+}
+
+
+
+```
