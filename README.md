@@ -57,29 +57,29 @@ To recreate our analysis and steps from our report in their entirety, several fi
       
 ### PreProcessing Files
 
-#### ExplainationOfImputation.Rmd  
+	 ExplainationOfImputation.Rmd  
 The file detailing the steps of selecting methods of imputation for the columns for 3 variables: Temperature, Acceleration, and Light. It is important to note that the purpose of this file is simply exploration of the reasoning behind the methods of imputation selected for later use; it is not intended to be the main file of imputation itself. This file reads in the original data set and creates several folders consisting of the data necessary for explanation of the models, as well as displays graphs showing the resulting “best” imputations. It is not necessary to run this file in order to run any files afterwards, ad it only provides explaination as to why certain imputation methods were chosen for certain columns.
 
-#### FillingAllNulls.qmd 
+	 FillingAllNulls.qmd 
 File that takes the original .csv file and creates files for individual balloons, then creates new imputed and indicator columns. The resulting file is `AllNullsFilled.csv`.
 
 ### Interactive Application
 
-#### OriginalMoonData.csv 
+	 OriginalMoonData.csv 
 This file contains information found at https://eclipse.gsfc.nasa.gov/SEpath/SEpath2001/SE2024Apr08Tpath.html, providing information about the location of the moon’s shadow at different times during the eclipse. Nothing need be done with this file - it is here to be read into cleaning moon.R
 
-#### cleaning moon.R 
+	 cleaning moon.R 
 This file is responsible for most of the transformation of the original data found from NASA to the data processed and used by the interactive application. It reads in `OriginalMoonData.csv`, while outputting `expanded_testingcleaningofmoon.csv`.
 
-#### expanded_testingcleaningofmoon.csv 
+	 expanded_testingcleaningofmoon.csv 
 This is the data that is the result of `cleaning moon.R`, should you not desire to re-run the cleaning file and just run the app itself. Nothing needs to be done on the user side with this file.
 
-#### app.R 
+	 app.R 
 This file is responsible for producing a Shiny application visualizing the data resulting from the PreProcessing Steps. It reads in both `expanded_testingcleaningofmoon.csv` and `AllNullsFilled.csv` and transforms that information into an interactive visual overlaying the path of the moon and balloons at the time indicated by a user-controlled slider. It also provides a table detailing information about each balloon at that time. 
 	
 ### Analysis
-#### AltitudeAndAccel.Rmd 
+	 AltitudeAndAccel.Rmd 
 This file includes steps taken to analyze the effects of totality on Acceleration between 60,000-70,000 ft. It also details a more generalized approach, looking at similar patterns in a higher number of balloons found in differing areas. It reads in `AllNullsFilled.csv`, walks through the steps of analysis, and gives conclusions/results including graphs and other observations. 
 
-#### TemperatureAnalysis.ipynb
+	 TemperatureAnalysis.ipynb
 This file is a supplementary file containing python code used to evaluate the effect of totality on temperature. 
