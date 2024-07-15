@@ -52,7 +52,7 @@ balloon:
 # Setting input and output directories and files
 output_dir<-"Individual Balloon Sheets"
 dir_create(output_dir)
-df <- read_csv('../2024-04-08 NSE Eclipse.xlsx - Main.csv', show_col_types = FALSE)
+df <- read_csv('2024-04-08 NSE Eclipse.xlsx - Main.csv', show_col_types = FALSE)
 balloons_of_interest <- unique(df$Balloon)
 
 # Filtering 
